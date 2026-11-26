@@ -41,6 +41,9 @@ const (
 	// connected peer may support. Raise it only after a protocol upgrade
 	// activates; raising it together with wire.ProtocolVersion would
 	// disconnect not-yet-upgraded peers that still share our chain.
+	//
+	// TODO: After the mainnet FP8 fork height has passed, raise it to the wire.ProtocolVersion of the release that
+	// set that height. Peers below that version do not follow the FP8 chain on mainnet.
 	MinAcceptableProtocolVersion = 2
 
 	// outputBufferSize is the number of elements the output channels use.

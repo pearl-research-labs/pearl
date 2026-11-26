@@ -280,6 +280,14 @@ type Params struct {
 	// Must not activate before MoEForkHeight: V3 supersedes V2.
 	SaltedSeedForkHeight int32
 
+	// Fp8ForkHeight is the block height at which the FP8 hardfork
+	// activates: at and after it blocks must carry a V4 certificate
+	// (wire.CertificateVersionV4). A value of 0 disables the fork.
+	//
+	// Must not activate before SaltedSeedForkHeight when that fork is
+	// scheduled (V4 supersedes V3), or before MoEForkHeight otherwise.
+	Fp8ForkHeight int32
+
 	// Mempool parameters
 	RelayNonStdTxs bool
 
@@ -323,11 +331,20 @@ func (p *Params) IsSaltedSeedForkActive(height int32) bool {
 	return p.SaltedSeedForkHeight != 0 && height >= p.SaltedSeedForkHeight
 }
 
+// IsFp8ForkActive reports whether the FP8 hardfork is active at the
+// given block height. The fork is disabled when Fp8ForkHeight is 0.
+func (p *Params) IsFp8ForkActive(height int32) bool {
+	return p.Fp8ForkHeight != 0 && height >= p.Fp8ForkHeight
+}
+
 // RequiredCertVersion returns the block certificate version that a block at the
-// given height must use under the strict hardfork cutovers: V3 at and after the
-// salted noise-seed fork, V2 at and after the MoE fork, V1 before both (and
-// always, when the forks are disabled).
+// given height must use under the strict hardfork cutovers: V4 at and after the
+// FP8 fork, V3 at and after the salted noise-seed fork, V2 at and after the MoE
+// fork, V1 before those (and always, when the forks are disabled).
 func (p *Params) RequiredCertVersion(height int32) wire.CertificateVersion {
+	if p.IsFp8ForkActive(height) {
+		return wire.CertificateVersionV4
+	}
 	if p.IsSaltedSeedForkActive(height) {
 		return wire.CertificateVersionV3
 	}
@@ -369,6 +386,11 @@ var MainNetParams = Params{
 	RankPenaltyForkHeight: 96251,
 
 	SaltedSeedForkHeight: 99000,
+
+	// The FP8 (V4) hardfork is not scheduled on mainnet: Fp8ForkHeight is unset.
+	//
+	// TODO: When Fp8ForkHeight is set here, increase wire.ProtocolVersion in the same release. Once that height has
+	// passed, raise peer.MinAcceptableProtocolVersion to that version.
 
 	// Checkpoints ordered from oldest to newest, one per 10000 blocks.
 	// Add the next multiple once it is at least CheckpointConfirmations
@@ -467,6 +489,9 @@ var RegressionNetParams = Params{
 
 	// Salted noise-seed (V3) fork active from genesis.
 	SaltedSeedForkHeight: 1,
+
+	// FP8 (V4) fork active from genesis; keep PowLimitBits easy enough for zkpow.MineV4 CPU generate.
+	Fp8ForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &regTestGenesisBlock,
@@ -580,6 +605,11 @@ var TestNetParams = Params{
 
 	SaltedSeedForkHeight: 38648,
 
+	// FP8 (V4) hardfork. It activated on 2026-11-17 at 22:44 UTC: block 67415, the first with a V4 certificate, is
+	// 1f6e799e6e50618798eaee715aa969021f69a2b6bee9c037ceb816db21f88923. The height is part of the chain's history,
+	// so it must not be moved.
+	Fp8ForkHeight: 67415,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -676,6 +706,8 @@ var TestNet2Params = Params{
 
 	SaltedSeedForkHeight: 83109,
 
+	Fp8ForkHeight: 150283,
+
 	// Checkpoints ordered from oldest to newest.
 	Checkpoints: nil,
 
@@ -758,6 +790,11 @@ var SimNetParams = Params{
 
 	// Salted noise-seed (V3) fork active from genesis.
 	SaltedSeedForkHeight: 1,
+
+	// FP8 (V4) fork active from genesis so local miner stacks see
+	// requiredcertversion=4. SimNet still skips proof verification
+	// (BFNoPoWCheck + dummy certs); use regtest to check a real V4 proof.
+	Fp8ForkHeight: 1,
 
 	// Chain parameters
 	GenesisBlock:         &simNetGenesisBlock,

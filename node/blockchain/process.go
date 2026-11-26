@@ -183,6 +183,11 @@ func (b *BlockChain) ProcessBlock(block *btcutil.Block, flags BehaviorFlags) (bo
 		return false, false, ruleError(ErrDuplicateBlock, str)
 	}
 
+	// The sanity checks verify the certificate, so reject a V4 certificate below the FP8 fork height first.
+	if err := b.checkV4CertHeight(block.MsgBlock()); err != nil {
+		return false, false, err
+	}
+
 	// Perform preliminary sanity checks on the block and its transactions.
 	sanityStart := time.Now()
 	err = checkBlockSanity(block, b.chainParams, b.timeSource, flags)

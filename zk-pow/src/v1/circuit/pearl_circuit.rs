@@ -258,6 +258,7 @@ impl RecursionCircuit for PearlRecursion {
                 rate_bits: params.rate_bits[0],
                 cap_height: 5,
                 proof_of_work_bits: params.pow_bits[0] as u32,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 7),
                 num_query_rounds: num_query_rounds(SECURITY_BITS, params.pow_bits[0], params.rate_bits[0]),
             },

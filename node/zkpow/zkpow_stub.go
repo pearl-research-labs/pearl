@@ -37,6 +37,10 @@ func Mine(header *wire.BlockHeader, certVersion wire.CertificateVersion) (wire.B
 	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable mining")
 }
 
+func MineV4(header, parent *wire.BlockHeader, device int) (*wire.CertificateV4, error) {
+	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable V4 mining")
+}
+
 func MineMoE(header *wire.BlockHeader, m, n, e, topK uint32,
 	certVersion wire.CertificateVersion) (wire.BlockCertificate, error) {
 	return nil, fmt.Errorf("zkpow: build with -tags zkpow to enable MoE mining")

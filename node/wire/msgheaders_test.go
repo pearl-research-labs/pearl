@@ -9,6 +9,7 @@ import (
 	"io"
 	"testing"
 
+	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/stretchr/testify/require"
 )
 
@@ -38,6 +39,39 @@ var oneHeaderEncoded = []byte{
 	0x61, 0xbc, 0x66, 0x49, 0xff, 0xff, 0x00, 0x1d, // Timestamp + Bits
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // ProofCommitment (32 zeros)
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+}
+
+func TestHeadersMaxPayloadLength(t *testing.T) {
+	// Stated independently of the production expression, which would agree with any value the code produces.
+	// 6,510,809 is the count varint (9) plus 100 headers, each 108 bytes with a maximum-size certificate (65,000).
+	want := uint32(6510809)
+	require.Equal(t, want, NewMsgHeaders().MaxPayloadLength(ProtocolVersion))
+}
+
+func TestHeadersLargeV4RoundTrip(t *testing.T) {
+	msg := NewMsgHeaders()
+	header := *blockOne.BlockHeader()
+	cert := &CertificateV4{
+		PublicData:      bytes.Repeat([]byte{0x11}, PublicDataMaxSizeV4),
+		ProofData:       bytes.Repeat([]byte{0x22}, MaxZKProofSize),
+		AncestorHeaders: []BlockHeader{header, header, header},
+	}
+	maxV4 := CertificateVersionSize + chainhash.HashSize + 4 + 4 + 1 + PublicDataMaxSizeV4 + MaxZKProofSize +
+		MaxCertificateV4AncestorHeaders*MaxBlockHeaderPayload
+	require.Equal(t, maxV4, (&MsgCertificate{Certificate: cert}).SerializeSize())
+	require.LessOrEqual(t, maxV4, CertificateMaxSize)
+	for i := range MaxBlockHeadersPerMsg {
+		header.Version = int32(i)
+		require.NoError(t, msg.AddBlockHeader(header, cert))
+	}
+
+	// A full batch of maximum-size V4 certificates fits the protocol limit.
+	var buf bytes.Buffer
+	_, err := WriteV2MessageN(&buf, msg, ProtocolVersion, BaseEncoding)
+	require.NoError(t, err)
+	decoded, _, err := ReadV2MessageN(buf.Bytes(), ProtocolVersion, BaseEncoding)
+	require.NoError(t, err)
+	require.Equal(t, msg, decoded)
 }
 
 // TestHeaders tests the MsgHeaders API.

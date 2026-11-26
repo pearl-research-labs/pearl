@@ -37,6 +37,7 @@ pub(crate) fn get_challenges<
     commit_phase_merkle_caps: &[MerkleCap<F, C::Hasher>],
     final_poly: &PolynomialCoeffs<F::Extension>,
     pow_witness: F,
+    batching_pow_witness: Option<F>,
     circuit_digest: &<<C as GenericConfig<D>>::Hasher as Hasher<C::F>>::Hash,
     common_data: &CommonCircuitData<F, D>,
 ) -> anyhow::Result<ProofChallenges<F, D>> {
@@ -92,6 +93,7 @@ pub(crate) fn get_challenges<
             commit_phase_merkle_caps,
             final_poly,
             pow_witness,
+            batching_pow_witness,
             common_data.degree_bits(),
             &config.fri_config,
             None,
@@ -131,6 +133,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self.proof;
@@ -144,6 +147,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             circuit_digest,
             common_data,
         )
@@ -170,6 +174,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self.proof;
@@ -183,17 +188,20 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             circuit_digest,
             common_data,
         )
     }
 
     /// Computes all coset elements that can be inferred in the FRI reduction steps.
+    // TODO: Validate compressed query maps before indexing: malformed transcripts can panic.
+    // This generic compressed-proof path is separate from the V2/V3/V4 compact codec.
     pub(crate) fn get_inferred_elements(
         &self,
         challenges: &ProofChallenges<F, D>,
         common_data: &CommonCircuitData<F, D>,
-    ) -> FriInferredElements<F, D> {
+    ) -> anyhow::Result<FriInferredElements<F, D>> {
         let ProofChallenges {
             plonk_zeta,
             fri_challenges:
@@ -205,6 +213,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 },
             ..
         } = challenges;
+        let query_round_proofs = &self.proof.opening_proof.query_round_proofs;
         let mut fri_inferred_elements = Vec::new();
         // Holds the indices that have already been seen at each reduction depth.
         let mut seen_indices_by_depth =
@@ -221,11 +230,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let mut subgroup_x = lde_coset_point(x_index, log_n);
             let mut old_eval = fri_combine_initial::<F, C, D>(
                 &common_data.get_fri_instance(*plonk_zeta),
-                &self
-                    .proof
-                    .opening_proof
-                    .query_round_proofs
-                    .initial_trees_proofs[&x_index],
+                query_round_proofs
+                    .initial_trees_proofs
+                    .get(&x_index)
+                    .ok_or_else(|| anyhow::anyhow!("Missing compressed FRI initial proof."))?,
                 *fri_alpha,
                 subgroup_x,
                 &precomputed_reduced_evals,
@@ -244,7 +252,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 }
                 fri_inferred_elements.push(old_eval);
                 let arity = 1 << arity_bits;
-                let mut evals = self.proof.opening_proof.query_round_proofs.steps[i][&coset_index]
+                let mut evals = query_round_proofs
+                    .steps
+                    .get(i)
+                    .and_then(|step| step.get(&coset_index))
+                    .ok_or_else(|| anyhow::anyhow!("Missing compressed FRI query step."))?
                     .evals
                     .clone();
                 let x_index_within_coset = x_index & (arity - 1);
@@ -260,7 +272,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 x_index = coset_index;
             }
         }
-        FriInferredElements(fri_inferred_elements)
+        Ok(FriInferredElements(fri_inferred_elements))
     }
 }
 
@@ -275,6 +287,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         commit_phase_merkle_caps: &[MerkleCapTarget],
         final_poly: &PolynomialCoeffsExtTarget<D>,
         pow_witness: Target,
+        batching_pow_witness: Option<Target>,
         inner_circuit_digest: HashOutTarget,
         inner_common_data: &CommonCircuitData<F, D>,
     ) -> ProofChallengesTarget<D>
@@ -335,6 +348,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 commit_phase_merkle_caps,
                 final_poly,
                 pow_witness,
+                batching_pow_witness,
                 &inner_common_data.config.fri_config,
             ),
         }
@@ -362,6 +376,7 @@ impl<const D: usize> ProofWithPublicInputsTarget<D> {
                     commit_phase_merkle_caps,
                     final_poly,
                     pow_witness,
+                    batching_pow_witness,
                     ..
                 },
         } = &self.proof;
@@ -375,6 +390,7 @@ impl<const D: usize> ProofWithPublicInputsTarget<D> {
             commit_phase_merkle_caps,
             final_poly,
             *pow_witness,
+            *batching_pow_witness,
             inner_circuit_digest,
             inner_common_data,
         )

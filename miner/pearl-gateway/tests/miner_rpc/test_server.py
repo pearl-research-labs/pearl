@@ -3,12 +3,14 @@ Unit tests for MinerRpcServer.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
 from pearl_gateway.miner_rpc.server import ClientInfo, MinerRpcServer
@@ -64,6 +66,23 @@ def no_auth_config():
 def sample_mining_job(sample_block_template):
     """Create a sample MiningJob for testing."""
     return MiningJob.from_template(sample_block_template)
+
+
+def enqueue(server, *entries):
+    server._pending.extend(entries)
+    server._pending_ready.set()
+
+
+async def run_consumer_until(server, done, timeout=5.0):
+    consumer = asyncio.create_task(server._consume_submissions())
+    try:
+        async with asyncio.timeout(timeout):
+            while not done():
+                await asyncio.sleep(0.01)
+    finally:
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
 
 
 class TestMinerRpcServerInit:
@@ -173,6 +192,89 @@ class TestMinerRpcServerHandlers:
             sample_plain_proof, sample_block_template
         )
 
+    async def test_handle_submit_plain_proof_drops_stale_job(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        """A submission whose job no longer matches the current template is dropped."""
+        server.work_cache.current_template = sample_block_template
+        stale_job = MiningJob(
+            incomplete_header_bytes=b"\x00" * 76,
+            target=1,
+            cert_version=CertificateVersion.ZK_MOE,
+        )
+
+        await server.handle_submit_plain_proof(sample_plain_proof, stale_job)
+
+        server.submission_service.submit_plain_proof.assert_not_called()
+
+    @pytest.mark.parametrize(("meets_target", "submitted"), [(True, True), (False, False)])
+    async def test_pool_share_is_checked_against_the_current_share_target(
+        self,
+        server,
+        sample_plain_proof,
+        sample_mining_job,
+        sample_block_template,
+        meets_target,
+        submitted,
+    ):
+        """After a difficulty increase, a proof is kept only if it meets the new target."""
+        sample_block_template.share_target = sample_mining_job.target - 1  # raised since mined
+        sample_block_template.share_bits = 0x1E010000
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.return_value = {"status": "accepted"}
+
+        with patch(
+            "pearl_gateway.miner_rpc.server.verify_plain_proof_for_cert_version",
+            return_value=(meets_target, "" if meets_target else "above target"),
+        ) as verify:
+            await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
+
+        assert verify.call_args.kwargs["nbits_override"] == 0x1E010000
+        assert server.submission_service.submit_plain_proof.called is submitted
+
+    async def test_handle_submit_plain_proof_drops_without_template(
+        self, server, sample_plain_proof, sample_mining_job
+    ):
+        """A queued submission is dropped (not raised) when no template is available."""
+        server.work_cache.current_template = None
+
+        await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
+
+        server.submission_service.submit_plain_proof.assert_not_called()
+
+    async def test_submission_consumer_processes_queued_submissions(
+        self, server, sample_plain_proof, sample_mining_job, sample_block_template
+    ):
+        """The consumer drains the queue and hands each submission to the service."""
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.return_value = {"status": "accepted"}
+
+        enqueue(server, (sample_plain_proof, sample_mining_job))
+        service = server.submission_service.submit_plain_proof
+        await run_consumer_until(server, lambda: service.call_count == 1)
+
+        server.submission_service.submit_plain_proof.assert_called_once_with(
+            sample_plain_proof, sample_block_template
+        )
+
+    async def test_submission_consumer_survives_handler_errors(
+        self, server, sample_plain_proof, sample_mining_job, sample_block_template
+    ):
+        """One failing submission must not stall the consumer for later ones."""
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.side_effect = [
+            RuntimeError("proof worker died"),
+            {"status": "accepted"},
+        ]
+
+        enqueue(
+            server, (sample_plain_proof, sample_mining_job), (sample_plain_proof, sample_mining_job)
+        )
+        service = server.submission_service.submit_plain_proof
+        await run_consumer_until(server, lambda: service.call_count == 2)
+
+        assert server.submission_service.submit_plain_proof.call_count == 2
+
 
 class TestMinerRpcServerJsonRpc:
     """Test JSON-RPC request handling."""
@@ -234,6 +336,73 @@ class TestMinerRpcServerJsonRpc:
         assert response["id"] == 2
         assert response.get("error") is None
         assert response["result"] == "submitted"
+
+    @staticmethod
+    def _submit_request(params, request_id):
+        return json.dumps(
+            {"jsonrpc": "2.0", "method": "submitPlainProof", "params": params, "id": request_id}
+        )
+
+    async def test_submit_plain_proof_rejects_stale_job_at_intake(
+        self, server, sample_block_template, submit_plain_proof_params, mock_client
+    ):
+        """A proof for a job that is no longer current is rejected, not queued."""
+        server.work_cache.current_template = sample_block_template
+        stale = dict(submit_plain_proof_params)
+        stale["mining_job"] = MiningJob(
+            incomplete_header_bytes=b"\x00" * 76, target=1, cert_version=CertificateVersion.ZK_MOE
+        ).to_dict()
+
+        response = await server._process_request(self._submit_request(stale, 4), mock_client)
+
+        assert response["error"]["message"] == "stale job"
+        assert not server._pending
+
+    async def test_full_queue_of_stale_entries_is_evicted_for_a_fresh_proof(
+        self, server, sample_block_template, submit_plain_proof_params, mock_client
+    ):
+        """Entries for a previous job cannot crowd out a proof for the current one."""
+        server.work_cache.current_template = sample_block_template
+        old_job = MiningJob(
+            incomplete_header_bytes=b"\x00" * 76, target=1, cert_version=CertificateVersion.ZK_MOE
+        )
+        enqueue(server, *[(None, old_job)] * server._max_pending)
+
+        response = await server._process_request(
+            self._submit_request(submit_plain_proof_params, 5), mock_client
+        )
+
+        assert response["result"] == "submitted"
+        assert len(server._pending) == 1
+
+    async def test_submit_plain_proof_rejected_when_queue_full(
+        self,
+        server,
+        sample_block_template,
+        sample_mining_job,
+        submit_plain_proof_params,
+        mock_client,
+    ):
+        """A flood of submissions is rejected once the queue capacity is reached."""
+        server.work_cache.current_template = sample_block_template
+        enqueue(server, *[(None, sample_mining_job)] * server._max_pending)
+
+        request_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "submitPlainProof",
+                "params": submit_plain_proof_params,
+                "id": 3,
+            }
+        )
+
+        response = await server._process_request(request_line, mock_client)
+
+        assert response["id"] == 3
+        assert response.get("result") is None
+        assert response["error"]["message"] == "proof submission queue full"
+        # Rejected before anything was enqueued for processing.
+        server.submission_service.submit_plain_proof.assert_not_called()
 
     async def test_invalid_json_request(self, server, mock_client):
         """Test handling of invalid JSON."""

@@ -284,7 +284,7 @@ def manage_mining_state(pearl_gateway_process):
 
 
 @pytest.fixture(scope="session", autouse=True)
-def pearl_gateway_process(sample_block_template, mining_address):  # noqa: C901
+def pearl_gateway_process(session_sample_block_template, mining_address):  # noqa: C901
     """
     Start pearl-gateway programmatically once per test session.
 
@@ -316,9 +316,9 @@ def pearl_gateway_process(sample_block_template, mining_address):  # noqa: C901
 
         # Populate work cache with mock block template for testing without node
         print("Populating gateway work cache with mock block template...")
-        await gateway_instance.work_cache.update_template(sample_block_template)
+        await gateway_instance.work_cache.update_template(session_sample_block_template)
         print(
-            f"✓ Work cache populated with block template at height {sample_block_template.height}"
+            f"✓ Work cache populated with block template at height {session_sample_block_template.height}"
         )
 
         # Keep the service running

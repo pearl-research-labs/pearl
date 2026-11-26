@@ -1271,7 +1271,7 @@ func TestHandleHeadersBansPeerOnInvalidSanity(t *testing.T) {
 			header: connecting(func(h *wire.BlockHeader) {
 				h.Timestamp = time.Now().Add(3 * time.Hour).Truncate(time.Second)
 			}),
-			cert:    &wire.CertificateV3{},
+			cert:    &wire.CertificateV4{},
 			wantBan: false,
 		},
 		{
@@ -1336,7 +1336,7 @@ func simnetHeader(prev *wire.BlockHeader, timestamp time.Time) wire.MsgHeader {
 			Timestamp: timestamp,
 			Bits:      chaincfg.SimNetParams.PowLimitBits,
 		},
-		MsgCertificate: wire.MsgCertificate{Certificate: &wire.CertificateV3{}},
+		MsgCertificate: wire.MsgCertificate{Certificate: &wire.CertificateV4{}},
 	}
 }
 
