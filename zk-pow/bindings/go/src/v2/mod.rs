@@ -3,7 +3,7 @@
 
 use std::os::raw::c_char;
 use std::slice;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use zk_pow::v2::api::proof::{IncompleteBlockHeader, MiningConfiguration, PublicProofParams};
 use zk_pow::v2::api::prove;
@@ -34,21 +34,12 @@ const _: () = assert!(MIN_NOISE_RANK as usize == zk_pow::v2::api::sanity_checks:
 
 type CircuitCache = <PearlRecursion as RecursionCircuit>::CircuitCache;
 
-lazy_static::lazy_static! {
-    /// Global circuit cache shared across Go FFI functions (verify and prove).
-    /// Protected by a Mutex for thread-safe access from multiple Go goroutines.
-    pub static ref CIRCUIT_CACHE: Mutex<CircuitCache> = {
-        use zk_pow::v2::circuit::embedded_cache;
-        Mutex::new(CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
-            .expect("V2 circuit cache is missing or corrupt; cannot verify proofs"))
-    };
-}
-
-/// Acquires the circuit cache. Recovers from poisoned mutex if a prior panic occurred.
-/// The cache data is still valid for verifier after a panic, since the CircuitCache is read only.
-pub(crate) fn acquire_cache() -> std::sync::MutexGuard<'static, CircuitCache> {
-    CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+/// Verifier circuits, parsed once from the embedded cache. Nothing writes to them, so verifiers share
+/// them without a lock.
+pub(crate) static VERIFIER_CACHE: LazyLock<CircuitCache> = LazyLock::new(|| {
+    CircuitCache::from_bytes(zk_pow::v2::circuit::embedded_cache::CACHE_DATA)
+        .expect("V2 circuit cache is missing or corrupt; cannot verify proofs")
+});
 
 /// Size of the committed public data in bytes for a standard (non-MoE) ZK proof (exported to C header).
 pub const PUBLICDATA_SIZE: usize = 164;
@@ -63,7 +54,10 @@ pub(crate) unsafe fn zk_prove(
     proof: &PlainProof,
     seed_derivation: SeedDerivation,
 ) -> Option<prove::ProveResult> {
-    let mut cache = acquire_cache();
+    // The prover's own circuits, compiled on first use; the verifier caches never see them.
+    static PROVER_CACHE: LazyLock<Mutex<CircuitCache>> = LazyLock::new(|| Mutex::new(CircuitCache::default()));
+
+    let mut cache = PROVER_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match catch_panic(|| prove::zk_prove_plain_proof(header, proof, &mut cache, false, seed_derivation)) {
         Ok(Ok(r)) => Some(r),
         Ok(Err(e)) => {

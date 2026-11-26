@@ -4,25 +4,17 @@
 
 use std::os::raw::c_char;
 use std::slice;
-use std::sync::Mutex;
+use std::sync::LazyLock;
 
 use crate::common::{catch_panic, set_error_msg, CZKProof, IncompleteBlockHeader, MAX_ZK_PROOF_SIZE};
 
 type V1CircuitCache = zk_pow::v1::circuit::circuit_utils::CircuitCache;
 
-lazy_static::lazy_static! {
-    /// V1 circuit cache for verifying version-1 (master-format) proofs.
-    pub static ref V1_CIRCUIT_CACHE: Mutex<V1CircuitCache> = {
-        use zk_pow::v1::embedded_cache;
-        Mutex::new(V1CircuitCache::from_bytes(embedded_cache::CACHE_DATA)
-            .expect("V1 circuit cache is missing or corrupt; cannot verify V1 proofs"))
-    };
-}
-
-/// Acquires the V1 circuit cache for version-1 proof verification.
-pub(crate) fn acquire_v1_cache() -> std::sync::MutexGuard<'static, V1CircuitCache> {
-    V1_CIRCUIT_CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+/// Verifier circuits for version-1 (master-format) proofs, parsed once from the embedded cache.
+pub(crate) static V1_VERIFIER_CACHE: LazyLock<V1CircuitCache> = LazyLock::new(|| {
+    V1CircuitCache::from_bytes(zk_pow::v1::embedded_cache::CACHE_DATA)
+        .expect("V1 circuit cache is missing or corrupt; cannot verify V1 proofs")
+});
 
 /// Verify a V1 (version 1, master-format) ZK proof.
 /// Uses the V1 circuit cache which contains master-compatible verifier circuits.
@@ -74,9 +66,7 @@ pub unsafe extern "C" fn verify_zk_proof_v1(
         let public_data = &zk_proof_ref.public_data[..zk_proof_ref.public_data_len];
         let proof_data = slice::from_raw_parts(zk_proof_ref.proof_blob, zk_proof_ref.proof_blob_len);
 
-        let cache = acquire_v1_cache();
-
-        match zk_pow::v1::verify_v1(&block_header_bytes, public_data, proof_data, &cache, None) {
+        match zk_pow::v1::verify_v1(&block_header_bytes, public_data, proof_data, &V1_VERIFIER_CACHE, None) {
             Ok(_) => {
                 set_error_msg(error_msg_out, "V1 proof verified successfully");
                 0

@@ -14,7 +14,7 @@ use zk_pow::v2::api::seed::SeedDerivation;
 use zk_pow::v2::api::verify;
 
 use crate::common::{catch_panic, set_error_msg, CZKProof};
-use crate::v2::acquire_cache;
+use crate::v2::VERIFIER_CACHE;
 
 // ============================================================================
 // ZK Proof Verification FFI
@@ -70,11 +70,8 @@ unsafe fn verify_zk_proof_inner(
             }
         };
 
-        // Acquire circuit cache (immutable - verifier doesn't modify cache)
-        let cache = acquire_cache();
-
         // Verify using cached circuits only (no compilation)
-        match verify::verify_block_cached_circuits_only(&params, &zk_proof, &cache, nbits_override) {
+        match verify::verify_block_cached_circuits_only(&params, &zk_proof, &VERIFIER_CACHE, nbits_override) {
             Ok(_) => {
                 set_error_msg(error_msg_out, "Proof verified successfully");
                 0

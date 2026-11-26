@@ -1223,11 +1223,31 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 		return
 	}
 
+	// Batch-verify the certificates of the leading headers that pass the loop's other checks; the loop then skips
+	// verifying those certificates.
+	verified := 0
+	if tail := sm.headerList.Back(); tail != nil {
+		prev := tail.Value.(*headerNode)
+		var err error
+		verified, err = sm.chain.VerifyHeaderCertificates(blockchain.HeaderBatch{
+			Headers:    msg.Headers,
+			PrevHash:   *prev.hash,
+			PrevHeight: prev.height,
+			StopHeight: sm.nextCheckpoint.Height,
+		})
+		if err != nil {
+			log.Warnf("Header from peer %s failed sanity check: %v -- disconnecting", peer.Addr(), err)
+			peer.Disconnect()
+
+			return
+		}
+	}
+
 	// Process all of the received headers ensuring each one connects to the
 	// previous and that checkpoints match.
 	receivedCheckpoint := false
 	var finalHash *chainhash.Hash
-	for _, msgHeader := range msg.Headers {
+	for i, msgHeader := range msg.Headers {
 		blockHeader := &msgHeader.BlockHeader
 		blockHash := blockHeader.BlockHash()
 		finalHash = &blockHash
@@ -1276,9 +1296,14 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			return
 		}
 
-		// Verify proof of work and certificate per header.
+		// Verify proof of work and certificate per header, except for
+		// the certificates verified up front.
+		flags := blockchain.BFNone
+		if i < verified {
+			flags = blockchain.BFCertificateVerified
+		}
 		if err := sm.chain.CheckHeaderSanity(
-			blockHeader, msgHeader.BlockCertificate(),
+			blockHeader, msgHeader.BlockCertificate(), flags,
 		); err != nil {
 			log.Warnf("Header from peer %s failed sanity check: "+
 				"%v -- disconnecting", peer.Addr(), err)
