@@ -605,8 +605,9 @@ var TestNetParams = Params{
 
 	SaltedSeedForkHeight: 38648,
 
-	// FP8 (V4) hardfork. Scheduled at tip 67302 (2026-11-17 15:40 UTC) plus
-	// ~4 hours at the observed ~209s block interval: ~19:40 UTC.
+	// FP8 (V4) hardfork. It activated on 2026-11-17 at 22:44 UTC: block 67415, the first with a V4 certificate, is
+	// 1f6e799e6e50618798eaee715aa969021f69a2b6bee9c037ceb816db21f88923. The height is part of the chain's history,
+	// so it must not be moved.
 	Fp8ForkHeight: 67415,
 
 	// Checkpoints ordered from oldest to newest.
