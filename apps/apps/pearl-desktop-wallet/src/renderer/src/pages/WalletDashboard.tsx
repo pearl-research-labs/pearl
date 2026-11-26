@@ -41,16 +41,7 @@ export default function WalletDashboard() {
     clearWalletData();
 
     try {
-      // During birthday recovery the Go wallet holds a bolt write txn for the
-      // duration of the current 2000-block batch, which makes the polite
-      // `walletlock` RPC hang for up to a minute. Fall back to a force-stop
-      // (SIGKILL) so the UI stays responsive. bbolt commits are atomic at txn
-      // boundaries, so a mid-batch kill just replays the batch on next open.
-      if (syncPhase === 'blocks') {
-        await window.appBridge.wallet.forceLockWallet();
-      } else {
-        await window.appBridge.wallet.lockWallet();
-      }
+      await window.appBridge.wallet.lockWallet();
       console.log('✅ Wallet locked successfully');
     } catch (err) {
       console.error('❌ Exception during wallet lock:', err);
