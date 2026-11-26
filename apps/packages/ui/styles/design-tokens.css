@@ -9,6 +9,16 @@
   --brand-light-silver: 0 0% 95%;
   /* #F2F2F2 */
 
+  /* Brand Colors - Accents (used by the brand-* Tailwind colors) */
+  --brand-light-green: 77 69% 72%;
+  /* #CDE986 */
+  --brand-green: 86 100% 26%;
+  /* #4B8500 */
+  --brand-summer-sky: 185 51% 71%;
+  /* #8FD4DB */
+  --brand-deep-teal: 180 100% 13%;
+  /* #004242 */
+
   /* Greys */
   --grey-light-1: 0 0% 98%;
   /* #FAFAFA */
