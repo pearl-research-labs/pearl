@@ -6,6 +6,7 @@ package netsync
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -172,6 +173,33 @@ type pauseMsg struct {
 type headerNode struct {
 	height int32
 	hash   *chainhash.Hash
+	// certHash is the hash of the certificate verified with this header; nil for the anchor.
+	certHash *chainhash.Hash
+}
+
+// certificateHash returns the hash of cert's wire encoding, or nil if it can't be encoded.
+func certificateHash(cert *wire.MsgCertificate) *chainhash.Hash {
+	h := sha256.New()
+	if err := cert.PrlEncode(h, wire.ProtocolVersion); err != nil {
+		return nil
+	}
+
+	var hash chainhash.Hash
+	copy(hash[:], h.Sum(nil))
+
+	return &hash
+}
+
+// certificateVerifiedWithHeader reports whether block carries exactly the certificate verified with
+// node's header. Matching the block hash isn't enough: the header commits to the certificate's
+// public data but not to its proof.
+func certificateVerifiedWithHeader(node *headerNode, block *btcutil.Block) bool {
+	if node.certHash == nil {
+		return false
+	}
+	blockCert := certificateHash(&block.MsgBlock().MsgHeader.MsgCertificate)
+
+	return blockCert != nil && *blockCert == *node.certHash
 }
 
 // peerSyncState stores additional information that the SyncManager tracks
@@ -868,6 +896,38 @@ func (sm *SyncManager) requestMissingAncestor(peer *peerpkg.Peer,
 	}
 }
 
+// matchHeadersFirstNode matches block against the next header in headers-first mode. A matching block is
+// eligible for less validation, since the headers were verified to link together and are valid up to the
+// next checkpoint: it gets BFFastAdd, plus BFCertificateVerified if it carries the certificate verified
+// with its header. Its header leaves the list unless it's the checkpoint, which the next round of headers
+// links to.
+func (sm *SyncManager) matchHeadersFirstNode(blockHash *chainhash.Hash,
+	block *btcutil.Block) (blockchain.BehaviorFlags, bool) {
+
+	if !sm.headersFirstMode {
+		return blockchain.BFNone, false
+	}
+	el := sm.headerList.Front()
+	if el == nil {
+		return blockchain.BFNone, false
+	}
+	node := el.Value.(*headerNode)
+	if !blockHash.IsEqual(node.hash) {
+		return blockchain.BFNone, false
+	}
+
+	flags := blockchain.BFFastAdd
+	if certificateVerifiedWithHeader(node, block) {
+		flags |= blockchain.BFCertificateVerified
+	}
+	if node.hash.IsEqual(sm.nextCheckpoint.Hash) {
+		return flags, true
+	}
+	sm.headerList.Remove(el)
+
+	return flags, false
+}
+
 // handleBlockMsg handles block messages from all peers.
 // Returns error if Block violates consensus rules.
 func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
@@ -894,29 +954,7 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) error {
 		}
 	}
 
-	// When in headers-first mode, if the block matches the hash of the
-	// first header in the list of headers that are being fetched, it's
-	// eligible for less validation since the headers have already been
-	// verified to link together and are valid up to the next checkpoint.
-	// Also, remove the list entry for all blocks except the checkpoint
-	// since it is needed to verify the next round of headers links
-	// properly.
-	isCheckpointBlock := false
-	behaviorFlags := blockchain.BFNone
-	if sm.headersFirstMode {
-		firstNodeEl := sm.headerList.Front()
-		if firstNodeEl != nil {
-			firstNode := firstNodeEl.Value.(*headerNode)
-			if blockHash.IsEqual(firstNode.hash) {
-				behaviorFlags |= blockchain.BFFastAdd
-				if firstNode.hash.IsEqual(sm.nextCheckpoint.Hash) {
-					isCheckpointBlock = true
-				} else {
-					sm.headerList.Remove(firstNodeEl)
-				}
-			}
-		}
-	}
+	behaviorFlags, isCheckpointBlock := sm.matchHeadersFirstNode(blockHash, bmsg.block)
 
 	// Remove block from request maps. Either chain will know about it and
 	// so we shouldn't have any more instances of trying to fetch it, or we
@@ -1312,6 +1350,7 @@ func (sm *SyncManager) handleHeadersMsg(hmsg *headersMsg) {
 			return
 		}
 
+		node.certHash = certificateHash(&msgHeader.MsgCertificate)
 		e := sm.headerList.PushBack(&node)
 		if sm.startHeader == nil {
 			sm.startHeader = e
