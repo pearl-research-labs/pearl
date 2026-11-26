@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/btcutil"
+	"github.com/pearl-research-labs/pearl/node/chaincfg"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 	"github.com/pearl-research-labs/pearl/node/wire"
 	"github.com/pearl-research-labs/pearl/wallet/walletdb"
@@ -788,4 +789,42 @@ func TestBlocks(t *testing.T) {
 
 	want := []Block{mined[1].Block, mined[2].Block, mined[0].Block}
 	assert.Equal(t, want, blocks)
+}
+
+// TestStoreBlockHash verifies that recorded block identities survive reopening and that heights with no wallet
+// transactions have no stored block identity.
+func TestStoreBlockHash(t *testing.T) {
+	t.Parallel()
+
+	s, db, err := testStore(t)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	block := &BlockMeta{
+		Block: Block{Height: 100, Hash: chainhash.Hash{3}},
+		Time:  time.Unix(1, 0),
+	}
+	rec := blockIdentityRecord(t, 1)
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		return s.InsertTx(tx.ReadWriteBucket(namespaceKey), rec, block)
+	})
+	require.NoError(t, err)
+
+	err = walletdb.View(db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(namespaceKey)
+		s, err = Open(ns, &chaincfg.TestNetParams)
+		require.NoError(t, err)
+
+		hash, err := s.BlockHash(ns, block.Height)
+		require.NoError(t, err)
+		require.Equal(t, &block.Hash, hash)
+
+		hash, err = s.BlockHash(ns, block.Height-1)
+		require.NoError(t, err)
+		require.Nil(t, hash)
+
+		return nil
+	})
+	require.NoError(t, err)
 }
