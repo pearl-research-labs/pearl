@@ -14,7 +14,7 @@ from pearl_gateway.blockchain_utils.pearl_header import PearlHeader
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.rpc_types import GetBlockTemplateResponse
 from pearl_mining import IncompleteBlockHeader
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 # Matches zk-pow's STATE_WINDOW_DEPTH: the proposed header is excluded.
 STATE_WINDOW_DEPTH = 4
@@ -73,6 +73,25 @@ HexUint32 = Annotated[int, BeforeValidator(_hex_to_uint32)]
 CertVersion = Annotated[CertificateVersion, BeforeValidator(_to_cert_version)]
 
 
+def _hex_to_ancestor_header(value: str | bytes) -> bytes:
+    header = _hex_to_bytes(value)
+    if len(header) != PearlHeader.get_serialized_header_size():
+        raise ValueError("ancestor headers must be full 108-byte wire headers")
+    return header
+
+
+AncestorHeader = Annotated[bytes, BeforeValidator(_hex_to_ancestor_header)]
+
+
+def _ancestor_window(value: Any) -> Any:
+    # Only the state window is ever used (parent_header, ancestor_chain_to), and the
+    # list is copied into every mining job, so drop anything past it.
+    return value[:STATE_WINDOW_DEPTH] if isinstance(value, list) else value
+
+
+AncestorWindow = Annotated[list[AncestorHeader], BeforeValidator(_ancestor_window)]
+
+
 class StratumNotify(BaseModel):
     """Validated mining.notify payload from a Stratum pool."""
 
@@ -100,10 +119,23 @@ class StratumNotify(BaseModel):
     ntime: HexUint32
     clean_jobs: bool
     cert_version: CertVersion
+    # Optional 11th param: full 108-byte ancestor headers, parent first. The pool
+    # sends it for cert-v4 (FP8) jobs, whose proofs key B by an ancestor header.
+    ancestor_headers: AncestorWindow = Field(default_factory=list)
     # extranonce1 exactly as the pool assigned it at subscribe.
     extranonce: bytes
     # Miner/proxy bytes appended after extranonce1; empty when the pool advertises no extranonce2.
     extranonce2: bytes = b""
+
+    @model_validator(mode="after")
+    def _ancestors_match_cert_version(self) -> "StratumNotify":
+        is_v4 = self.cert_version == CertificateVersion.PLAIN_FP8
+        if is_v4 and not self.ancestor_headers:
+            raise ValueError("cert-v4 mining.notify carries no ancestor headers to key B by")
+        if not is_v4 and self.ancestor_headers:
+            # parent_header would key B by them for any version, unlike solo mode.
+            raise ValueError("ancestor headers are only valid on a cert-v4 mining.notify")
+        return self
 
     @classmethod
     def from_params(
@@ -112,9 +144,15 @@ class StratumNotify(BaseModel):
         extranonce: bytes,
         extranonce2: bytes = b"",
     ) -> "StratumNotify":
-        """Validate positional Stratum mining.notify params."""
+        """Validate positional Stratum mining.notify params.
 
-        data = dict(zip(cls.PARAM_FIELDS, params, strict=True))
+        Ten params, or eleven when the pool appends ancestor headers (cert-v4
+        jobs), so pools that never send the 11th keep working.
+        """
+        data: dict[str, Any] = {}
+        if len(params) == len(cls.PARAM_FIELDS) + 1:
+            *params, data["ancestor_headers"] = params
+        data |= dict(zip(cls.PARAM_FIELDS, params, strict=True))
         data["extranonce"] = extranonce
         data["extranonce2"] = extranonce2
         return cls.model_validate(data)
@@ -185,9 +223,7 @@ class BlockTemplate:
         if int(data.target, 16) != bits_translation:
             raise ValueError(f"target and bits must match: {data.target} != {bits_translation}")
 
-        ancestor_headers = [bytes.fromhex(header) for header in data.ancestorheaders]
-        if any(len(h) != PearlHeader.get_serialized_header_size() for h in ancestor_headers):
-            raise ValueError("ancestor headers must be full 108-byte wire headers")
+        ancestor_headers = [_hex_to_ancestor_header(header) for header in data.ancestorheaders]
 
         return cls(
             header=PearlHeader(
@@ -239,6 +275,7 @@ class BlockTemplate:
             # silently drops data in segwit mode.
             coinbase_tx=Transaction.from_raw(coinbase_bytes.hex()),
             required_cert_version=notify.cert_version,
+            ancestor_headers=list(notify.ancestor_headers),
             job_id=notify.job_id,
             extranonce2=extranonce2 if extranonce2 else None,
         )

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from pearl_gateway.blockchain_utils.blockchain_utils import bits_to_target
+from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.stratum import AsyncJSONRPCClient
 from pearl_gateway.config import PoolConfig
 from pearl_gateway.pool_stratum_client import PoolStratumClient
@@ -392,6 +393,25 @@ class TestPoolStratumClient:
             await handshake
 
         await stop_listener(listen_task)
+
+    @pytest.mark.asyncio
+    async def test_cert_v4_mining_notify_gives_miners_the_ancestor_headers(
+        self, pool_config: PoolConfig, work_cache: WorkCache
+    ):
+        client, _, _ = make_connected_client(pool_config, work_cache)
+        client._extranonce = bytes(4)
+        parent = bytes(range(108))
+        params = mining_notify_params(job_id="v4-job", clean_jobs=True, cert_version=4)
+        params.append([parent.hex()])
+
+        await client._on_mining_notify(params)
+
+        template = work_cache.current_template
+        assert template is not None and template.job_id == "v4-job"
+        assert template.required_cert_version == CertificateVersion.PLAIN_FP8
+        job = await work_cache.get_mining_job()
+        assert job.cert_version == CertificateVersion.PLAIN_FP8
+        assert job.parent_header == parent
 
     @pytest.mark.asyncio
     async def test_mining_notify_updates_work_cache(

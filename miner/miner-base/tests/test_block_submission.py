@@ -28,6 +28,7 @@ from miner_base.protocol import (
     tall_tile_mining_config,
 )
 from miner_base.settings import MinerSettings
+from pearl_gateway.blockchain_utils.blockchain_utils import bits_to_target
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import MiningJob
 from pearl_gateway.config import MinerRpcConfig
@@ -678,6 +679,18 @@ def test_submission_resolves_the_selected_b_ancestor(depth):
             opening, replace(job, ancestor_headers=job.ancestor_headers[:-1]), client
         )
     client.submit_plain_proof.assert_not_called()
+
+
+def test_submission_accepts_a_share_that_only_meets_the_job_target():
+    # A pool share meets the job's share target but not the header's network
+    # nbits; verifying against the header dropped every pool share.
+    job = replace(_plain_job(), target=bits_to_target(0x207FFFFF))  # every tile wins
+    client = Mock()
+
+    proof = submit_opened_block(_opening(), job, client)
+
+    assert proof is not None
+    client.submit_plain_proof.assert_called_once_with(proof, job)
 
 
 def test_submission_rejects_non_fp8_job_before_gateway_handoff():
