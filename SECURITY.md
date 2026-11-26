@@ -13,8 +13,9 @@ This policy covers all components in the Pearl monorepo:
 - **Frontend applications** (`apps/`)
 
 All components are covered by this policy for vulnerability reporting and
-coordinated disclosure. Bounty rewards, however, apply only to a subset of
-components — see [Bounty scope](#bounty-scope).
+coordinated disclosure. Bounty rewards, however, apply only to vulnerabilities
+that affect mainnet, in a subset of components — see
+[Bounty scope](#bounty-scope).
 
 ## Supported Versions
 
@@ -53,8 +54,8 @@ contractual offer, contest, or guarantee of payment.
 
 ### Bounty scope
 
-Bounty rewards apply only to vulnerabilities in the protocol, the node, and the
-wallet components:
+Bounty rewards apply only to vulnerabilities that affect **mainnet**, in the
+protocol, the node, and the wallet components:
 
 - **pearld** — full node and protocol (`node/`)
 - **ZK proof-of-work** circuits and verifier (`zk-pow/`, `plonky2/`)
@@ -70,6 +71,21 @@ scope. Nevertheless, such findings may still be reported privately via
 [Reporting a Vulnerability](#reporting-a-vulnerability), or as regular
 [GitHub issues](https://github.com/pearl-research-labs/pearl/issues) for
 non-security bugs.
+
+To affect mainnet, an issue must be exploitable against the latest supported
+release under mainnet's consensus rules and parameters. Issues in code that is
+not activated, or otherwise not reachable, on mainnet are
+**not bounty-eligible**, even if that code is merged to `master`, included in
+a release, and part of a component listed above. This covers consensus rules,
+certificate versions, and features that are active only on testnet, regtest,
+or simnet: for example, a hard fork that has no mainnet activation height.
+A hard fork counts as activated here once a release sets its mainnet
+activation height, including before mainnet reaches that height. Testnet,
+regtest, and simnet activate rules that mainnet does not, so a report must
+show that the issue applies under mainnet's rules. Findings that are not
+bounty-eligible for this reason may still be reported privately via
+[Reporting a Vulnerability](#reporting-a-vulnerability), but no reward is
+implied.
 
 Reports against other components in the repo (`miner/`, `py-pearl-mining/`,
 `apps/`) are **not bounty-eligible** and should be filed as
@@ -129,6 +145,8 @@ slowing a single node in a way that clears when the attack stops.
 
 ### Not eligible
 
+- Issues in code that is not activated, or otherwise not reachable, on mainnet
+  (see [Bounty scope](#bounty-scope))
 - Attacks that require a majority of hashrate or of a node's peers
 - Volumetric flooding (bandwidth or connection floods) without an
   amplification or protocol flaw
