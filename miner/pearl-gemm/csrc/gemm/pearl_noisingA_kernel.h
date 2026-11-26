@@ -93,7 +93,12 @@ class NoisingKernelA {
   static constexpr int kNumMmaWarpgroups = 1;
   static constexpr int kNumMmaThreads =
       kNumMmaWarpgroups * kNumThreadsPerWarpGroup;
-  using AtomLayoutMma = Layout<Shape<Int<kNumMmaWarpgroups>, _1, _1>>;
+  // Blackwell port: SM80 mma.sync 16x8x32 int8 atom tiled as 4 warps per
+  // warpgroup (matching Hopper's CLayout_64xN per-thread fragment ownership
+  // exactly — same row groups per warp, same value packing). See
+  // kernel_traits.hpp for the bit-identicality argument.
+  static constexpr int kWarpsPerWarpGroupMma = 4;
+  using AtomLayoutMma = Layout<Shape<Int<kWarpsPerWarpGroupMma * kNumMmaWarpgroups>, _1, _1>>;
 
   /*
   Tiled WGMMA for A * EBL, int8 * int8 -> int32, size (bM, R, bK) for one k_block.
@@ -106,9 +111,9 @@ class NoisingKernelA {
   layout is handled by swizzles in the SMEM layouts.
   */
   using TiledMmaMRK = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_MRK>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Underscore, cute::Int<R>, cute::Underscore>{}));
 
   /*
   Tiled WGMMA for A + EAL * EAR, size (bM, bK, R) for one k_block iteration.
@@ -118,9 +123,9 @@ class NoisingKernelA {
   The operands are both sourced from SMEM, but accumulator is in RMEM.
   */
   using TiledMmaMKR = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_MKR>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Underscore, cute::Int<kBlockK>, cute::Underscore>{}));
 
   /*
   Smem layouts for the smem tensors, used primarily for TMA and WGMMA. Sizes are
@@ -239,9 +244,9 @@ class NoisingKernelA {
   // accumulator.
   using TileShape_MKR_half = Shape<Int<kBlockM>, Int<kBlockK / 2>, Int<R>>;
   using TiledMmaMKR_half = decltype(cute::make_tiled_mma(
-      cute::GMMA::ss_op_selector<Element, Element, ElementAccum,
-                                 TileShape_MKR_half>(),
-      AtomLayoutMma{}));
+      cute::MMA_Atom<cute::SM80_16x8x32_S32S8S8S32_TN>{},
+      AtomLayoutMma{},
+      cute::Tile<cute::Underscore, cute::Int<kBlockK / 2>, cute::Underscore>{}));
   using S2RCopyAtomA = Copy_Atom<SM75_U32x4_LDSM_N, uint16_t>;
   using R2SCopyAtomA = Copy_Atom<SM90_U32x4_STSM_N, uint16_t>;
 
@@ -535,9 +540,28 @@ class NoisingKernelA {
     Tensor tCsA = thr_mma.partition_A(sA);      // (MMA,MMA_M,MMA_K,P)
     Tensor tCsEBL = thr_mma.partition_B(sEBL);  // (MMA,MMA_N,MMA_K,P)
 
-    // Allocate "fragments" -- these are WGMMA matrix descriptors
+    // Allocate "fragments" — on Hopper these are WGMMA descriptors; on
+    // Blackwell consumer (sm_120/121) they are register fragments populated
+    // by ldmatrix below.
     Tensor tCrA = thr_mma.make_fragment_A(tCsA);      // (MMA,MMA_M,MMA_K,P)
     Tensor tCrEBL = thr_mma.make_fragment_B(tCsEBL);  // (MMA,MMA_N,MMA_K,P)
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using S2RCopyAtom_Op =
+        Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+    auto s2r_tiled_copy_A_op =
+        make_tiled_copy_A(S2RCopyAtom_Op{}, tiled_mma);
+    auto s2r_tiled_copy_B_op =
+        make_tiled_copy_B(S2RCopyAtom_Op{}, tiled_mma);
+    auto s2r_thr_copy_A_op =
+        s2r_tiled_copy_A_op.get_thread_slice(tid);
+    auto s2r_thr_copy_B_op =
+        s2r_tiled_copy_B_op.get_thread_slice(tid);
+    Tensor tCsA_s2r = s2r_thr_copy_A_op.partition_S(sA);
+    Tensor tCsEBL_s2r = s2r_thr_copy_B_op.partition_S(sEBL);
+    Tensor tCrA_view = s2r_thr_copy_A_op.retile_D(tCrA);
+    Tensor tCrEBL_view = s2r_thr_copy_B_op.retile_D(tCrEBL);
+#endif
 
     LoadPipelineState smem_pipe_read_a;
     LoadPipelineState smem_pipe_read_ebl;
@@ -547,16 +571,39 @@ class NoisingKernelA {
       pipeline_a.consumer_wait(smem_pipe_read_a);
       pipeline_ebl.consumer_wait(smem_pipe_read_ebl);
 
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrAxEBL);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: ldmatrix-load A and EBL operands from SMEM into registers
+      // before mma.sync. (WGMMA's SMEM-descriptor path doesn't work for
+      // SM80 register-operand mma.sync.)
+      cute::copy(s2r_tiled_copy_A_op,
+                 tCsA_s2r(_, _, _, smem_pipe_read_a.index()),
+                 tCrA_view(_, _, _, smem_pipe_read_a.index()));
+      cute::copy(s2r_tiled_copy_B_op,
+                 tCsEBL_s2r(_, _, _, smem_pipe_read_ebl.index()),
+                 tCrEBL_view(_, _, _, smem_pipe_read_ebl.index()));
+#endif
       // WGMMA with dispatch mode (V,M,K) x (V,N,K) => (V,M,N)
       gemm(tiled_mma, tCrA(_, _, _, smem_pipe_read_a.index()),
            tCrEBL(_, _, _, smem_pipe_read_ebl.index()), tCrAxEBL);
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
+#endif
       // Wait for all MMAs across the warp group to complete
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_wait<0>();
+#endif
 
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrAxEBL);
+#endif
 
       cutlass::arch::fence_view_async_shared();
       pipeline_a.consumer_release(smem_pipe_read_a);
@@ -604,17 +651,37 @@ class NoisingKernelA {
 
     // (ATOM, REST_M, REST_R)
     Tensor tCsEAL = thr_mma.partition_A(sEAL);
-    // (1, REST_M, REST_R) -- tensor of WGMMA descriptors, 1 per atom
-    Tensor tCrEAL = thr_mma.make_fragment_A(tCsEAL);
+    // On Hopper these are WGMMA descriptors. On Blackwell (sm_120/121) we
+    // populate the register fragments via ldmatrix below.
+    Tensor tCrEAL = thr_mma.make_fragment_A(tCsEAL);  // (1, REST_M, REST_R)
 
-    // (ATOM, REST_K, REST_R)
-    Tensor tCsEAR = thr_mma.partition_B(sEAR);
-    // (1, REST_K, REST_R) -- tensor of WGMMA descriptors, 1 per atom
-    Tensor tCrEAR = thr_mma.make_fragment_B(tCsEAR);
+    Tensor tCsEAR = thr_mma.partition_B(sEAR);          // (ATOM, REST_K, REST_R)
+    Tensor tCrEAR = thr_mma.make_fragment_B(tCsEAR);    // (1, REST_K, REST_R)
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    using S2RCopyAtom_EALEAR =
+        Copy_Atom<SM75_U32x4_LDSM_N, Element>;
+    auto s2r_tiled_copy_EAL =
+        make_tiled_copy_A(S2RCopyAtom_EALEAR{}, tiled_mma);
+    auto s2r_tiled_copy_EAR =
+        make_tiled_copy_B(S2RCopyAtom_EALEAR{}, tiled_mma);
+    auto s2r_thr_copy_EAL =
+        s2r_tiled_copy_EAL.get_thread_slice(tid);
+    auto s2r_thr_copy_EAR =
+        s2r_tiled_copy_EAR.get_thread_slice(tid);
+    Tensor tCsEAL_s2r = s2r_thr_copy_EAL.partition_S(sEAL);
+    Tensor tCsEAR_s2r = s2r_thr_copy_EAR.partition_S(sEAR);
+    Tensor tCrEAL_view = s2r_thr_copy_EAL.retile_D(tCrEAL);
+    Tensor tCrEAR_view = s2r_thr_copy_EAR.retile_D(tCrEAR);
+#endif
 
     // Wait for EAL load. It does not change with K, so only once
     uint64_t* eal_mbar = &shared_storage.eal_mbar;
     ProducerBarType::wait(eal_mbar, 0);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    // SM80: EAL is loaded into SMEM once; ldmatrix it into registers once.
+    cute::copy(s2r_tiled_copy_EAL, tCsEAL_s2r, tCrEAL_view);
+#endif
 
     // S2R copy for A to add to the accumulator
     TiledMmaMKR_half tiled_mma_half;
@@ -647,13 +714,25 @@ class NoisingKernelA {
       // WGMMA: A + EAL * EAR
       clear(tCrApEA);  // We store every iter so we need to clear
       pipeline_ear.consumer_wait(smem_pipe_read_ear);
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_fence_operand(tCrApEA);
       warpgroup_arrive();
+#endif
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+      // SM80: ldmatrix EAR for this pipe stage before mma.sync.
+      cute::copy(s2r_tiled_copy_EAR,
+                 tCsEAR_s2r(_, _, _, smem_pipe_read_ear.index()),
+                 tCrEAR_view(_, _, _, smem_pipe_read_ear.index()));
+#endif
       gemm(tiled_mma, tCrEAL, tCrEAR(_, _, _, smem_pipe_read_ear.index()),
            tCrApEA);
+      // Hopper-only WGMMA sync; no-op on Blackwell consumer (sm_120/121)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
       warpgroup_commit_batch();
       warpgroup_wait<0>();
       warpgroup_fence_operand(tCrApEA);
+#endif
       pipeline_ear.consumer_release(smem_pipe_read_ear);
       ++smem_pipe_read_ear;
       // Convert down from int32 accumulator to int8
