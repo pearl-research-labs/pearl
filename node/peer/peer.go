@@ -41,6 +41,9 @@ const (
 	// connected peer may support. Raise it only after a protocol upgrade
 	// activates; raising it together with wire.ProtocolVersion would
 	// disconnect not-yet-upgraded peers that still share our chain.
+	//
+	// TODO: After the mainnet FP8 fork height has passed, raise it to the wire.ProtocolVersion of the release that
+	// set that height. Peers below that version do not follow the FP8 chain on mainnet.
 	MinAcceptableProtocolVersion = 2
 
 	// outputBufferSize is the number of elements the output channels use.
@@ -1279,9 +1282,9 @@ func (p *Peer) stallHandler() {
 	stallTicker := time.NewTicker(stallTickInterval)
 	defer stallTicker.Stop()
 
-	// ioStopped is used to detect when both the input and output handler
-	// goroutines are done.
-	var ioStopped bool
+	// A closed quit channel stays ready, so each is cleared once observed;
+	// exiting before both handlers stop strands them on stallControl.
+	inQuit, outQuit := p.inQuit, p.outQuit
 out:
 	for {
 		select {
@@ -1382,21 +1385,17 @@ out:
 			// Reset the deadline offset for the next tick.
 			deadlineOffset = 0
 
-		case <-p.inQuit:
-			// The stall handler can exit once both the input and
-			// output handler goroutines are done.
-			if ioStopped {
+		case <-inQuit:
+			inQuit = nil
+			if outQuit == nil {
 				break out
 			}
-			ioStopped = true
 
-		case <-p.outQuit:
-			// The stall handler can exit once both the input and
-			// output handler goroutines are done.
-			if ioStopped {
+		case <-outQuit:
+			outQuit = nil
+			if inQuit == nil {
 				break out
 			}
-			ioStopped = true
 		}
 	}
 

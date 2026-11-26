@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/pearl-research-labs/pearl/node/wire"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -89,6 +90,7 @@ type testCtx struct {
 	nextJob    chan<- *queryJob
 	jobResults chan *jobResult
 	peer       *mockPeer
+	quit       chan struct{}
 	workerDone chan struct{}
 }
 
@@ -126,6 +128,7 @@ func startWorker() (*testCtx, error) {
 		nextJob:    wk.NewJob(),
 		jobResults: results,
 		peer:       peer,
+		quit:       quit,
 		workerDone: done,
 	}, nil
 }
@@ -470,5 +473,21 @@ func TestWorkerJobCanceled(t *testing.T) {
 			t.Fatalf("expected peer to be %v, was %v",
 				ctx.peer.Addr(), result.peer)
 		}
+	}
+}
+
+// TestWorkerQuit checks that an idle worker returns when quit is closed.
+func TestWorkerQuit(t *testing.T) {
+	t.Parallel()
+
+	ctx, err := startWorker()
+	require.NoError(t, err)
+
+	close(ctx.quit)
+
+	select {
+	case <-ctx.workerDone:
+	case <-time.After(time.Second):
+		require.FailNow(t, "worker did not exit")
 	}
 }

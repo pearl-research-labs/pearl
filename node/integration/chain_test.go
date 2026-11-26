@@ -145,7 +145,7 @@ func createTxInMempool(t *testing.T, r *rpctest.Harness) *wire.MsgTx {
 		tx, sigHashes, 0, outputValue, testPkScript, txscript.SigHashDefault, outputKey,
 	)
 	require.NoError(t, err)
-	tx.TxIn[0].Witness = witness
+	tx.TxIn[0].SetWitness(witness)
 
 	// Send the tx.
 	_, err = r.Client.SendRawTransaction(tx, true)

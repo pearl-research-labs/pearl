@@ -244,7 +244,6 @@ func NewGetBalancesCmd() *GetBalancesCmd {
 type GetNewAddressCmd struct {
 	Account     *string
 	AddressType *string
-	PQ          *bool
 }
 
 // NewGetNewAddressCmd returns a new instance which can be used to issue a
@@ -263,7 +262,6 @@ func NewGetNewAddressCmd(account, addrType *string) *GetNewAddressCmd {
 type GetRawChangeAddressCmd struct {
 	Account     *string
 	AddressType *string
-	PQ          *bool
 }
 
 // NewGetRawChangeAddressCmd returns a new instance which can be used to issue a

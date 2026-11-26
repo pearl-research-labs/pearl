@@ -6,11 +6,11 @@ package wire
 
 import (
 	"bytes"
-	"reflect"
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
+	"github.com/stretchr/testify/require"
 )
 
 // TestInvVectStringer tests the stringized output for inventory vector types.
@@ -158,18 +158,8 @@ func TestInvVectWire(t *testing.T) {
 		}
 
 		// Decode the message from wire format.
-		var iv InvVect
-		rbuf := bytes.NewReader(test.buf)
-		err = readInvVectBuf(rbuf, test.pver, &iv, b[:])
-		if err != nil {
-			t.Errorf("readInvVect #%d error %v", i, err)
-			continue
-		}
-		if !reflect.DeepEqual(iv, test.out) {
-			t.Errorf("readInvVect #%d\n got: %s want: %s", i,
-				spew.Sdump(iv), spew.Sdump(test.out))
-			continue
-		}
+		require.Len(t, test.buf, maxInvVectPayload, "decodeInvVect #%d", i)
+		require.Equal(t, test.out, decodeInvVect(test.buf), "decodeInvVect #%d", i)
 	}
 }
 

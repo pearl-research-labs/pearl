@@ -110,6 +110,13 @@ pub struct FriProof<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> 
     pub final_poly: PolynomialCoeffs<F::Extension>,
     /// Witness showing that the prover did PoW.
     pub pow_witness: F,
+    /// Present iff trusted config enables batching PoW; use the proof codec for enabled nonces.
+    #[serde(
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "reject_nonce"
+    )]
+    pub batching_pow_witness: Option<F>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +125,7 @@ pub struct FriProofTarget<const D: usize> {
     pub query_round_proofs: Vec<FriQueryRoundTarget<D>>,
     pub final_poly: PolynomialCoeffsExtTarget<D>,
     pub pow_witness: Target,
+    pub batching_pow_witness: Option<Target>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -131,6 +139,13 @@ pub struct CompressedFriProof<F: RichField + Extendable<D>, H: Hasher<F>, const 
     pub final_poly: PolynomialCoeffs<F::Extension>,
     /// Witness showing that the prover did PoW.
     pub pow_witness: F,
+    /// Present iff trusted config enables batching PoW; use the proof codec for enabled nonces.
+    #[serde(
+        skip_deserializing,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "reject_nonce"
+    )]
+    pub batching_pow_witness: Option<F>,
 }
 
 impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, D> {
@@ -141,6 +156,7 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, 
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
             ..
         } = self;
         let cap_height = params.config.cap_height;
@@ -231,6 +247,7 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, 
             query_round_proofs: compressed_query_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
         }
     }
 }
@@ -248,6 +265,7 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
             query_round_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
             ..
         } = self;
         let FriChallenges {
@@ -356,6 +374,7 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
             query_round_proofs: decompressed_query_proofs,
             final_poly,
             pow_witness,
+            batching_pow_witness,
         }
     }
 }
@@ -369,6 +388,7 @@ pub struct FriChallenges<F: RichField + Extendable<D>, const D: usize> {
     pub fri_betas: Vec<F::Extension>,
 
     pub fri_pow_response: F,
+    pub batching_pow_response: Option<F>,
 
     // Indices at which the oracle is queried in FRI.
     pub fri_query_indices: Vec<usize>,
@@ -379,5 +399,13 @@ pub struct FriChallengesTarget<const D: usize> {
     pub fri_alpha: ExtensionTarget<D>,
     pub fri_betas: Vec<ExtensionTarget<D>>,
     pub fri_pow_response: Target,
+    pub batching_pow_response: Option<Target>,
     pub fri_query_indices: Vec<Target>,
+}
+
+// Enabled nonces use the proof codec; serde retains its original four fields.
+fn reject_nonce<F, S: serde::Serializer>(_: &Option<F>, _: S) -> Result<S::Ok, S::Error> {
+    Err(serde::ser::Error::custom(
+        "batching PoW requires the proof codec",
+    ))
 }

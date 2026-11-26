@@ -2,12 +2,13 @@ import asyncio
 import contextlib
 import json
 import os
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
 import fastjsonschema
 from miner_utils import get_logger
-from pearl_mining import PlainProof
+from pearl_mining import IncompleteBlockHeader, PlainProof, verify_plain_proof_for_cert_version
 
 from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
@@ -57,6 +58,13 @@ class MinerRpcServer:
         self.server: asyncio.Server | None = None
         self.clients: dict[int, ClientInfo] = {}
         self._next_client_id = 0
+        # Bounded intake: excess submissions are rejected at the RPC boundary rather
+        # than queued unboundedly while the single proving worker catches up. A deque
+        # (not asyncio.Queue) so stale entries can be evicted when it fills.
+        self._pending: deque[tuple[PlainProof, MiningJob]] = deque()
+        self._max_pending = max(1, config.max_pending)
+        self._pending_ready = asyncio.Event()
+        self._submission_consumer: asyncio.Task | None = None
 
     def _allocate_client_id(self) -> int:
         """Allocate a unique client ID."""
@@ -83,6 +91,8 @@ class MinerRpcServer:
             await self._start_uds()
         else:
             await self._start_tcp()
+
+        self._submission_consumer = asyncio.create_task(self._consume_submissions())
 
     async def _start_uds(self):
         """Start the server on a Unix Domain Socket."""
@@ -123,6 +133,13 @@ class MinerRpcServer:
             self.server.close()
             await self.server.wait_closed()
             self.server = None
+
+        # Intake is closed above; cancel the consumer, dropping any queued submissions.
+        if self._submission_consumer is not None:
+            self._submission_consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._submission_consumer
+            self._submission_consumer = None
 
         # Clean up UDS file if applicable
         if self.config.transport == "uds" and os.path.exists(self.config.socket_path):
@@ -212,12 +229,7 @@ class MinerRpcServer:
                 return self._jsonrpc_success(job.to_dict(), request_id)
 
             elif method == "submitPlainProof":
-                if error := self._validate_params(validate_submit_plain_proof, params, request_id):
-                    return error
-                plain_proof = PlainProof.from_base64(params["plain_proof"])
-                mining_job = MiningJob.from_dict(params["mining_job"])
-                asyncio.create_task(self.handle_submit_plain_proof(plain_proof, mining_job))
-                return self._jsonrpc_success("submitted", request_id)
+                return self._accept_plain_proof(params, request_id)
 
             else:
                 return self._jsonrpc_error(-32601, f"Method {method} not found", request_id)
@@ -234,26 +246,82 @@ class MinerRpcServer:
             logger.exception(f"Error handling RPC request: {e}")
             return self._jsonrpc_error(-32000, str(e), request_id)
 
+    def _accept_plain_proof(self, params: dict[str, Any], request_id: int | None) -> dict[str, Any]:
+        """Validate, apply backpressure, and enqueue a submitPlainProof request."""
+        if error := self._validate_params(validate_submit_plain_proof, params, request_id):
+            return error
+
+        # The job is cheap to parse; the (miner-controlled) proof is parsed only after
+        # the checks. No awaits until append, so the queue cannot fill in between.
+        mining_job = MiningJob.from_dict(params["mining_job"])
+        current = self._current_header()
+        if mining_job.incomplete_header_bytes != current:
+            logger.info("Rejecting submitPlainProof for a stale job")
+            return self._jsonrpc_error(-32000, "stale job", request_id)
+
+        if len(self._pending) >= self._max_pending:
+            # Entries for a previous job would be dropped at dequeue anyway; evict them
+            # so they cannot crowd out a proof for the current job.
+            self._pending = deque(
+                entry for entry in self._pending if entry[1].incomplete_header_bytes == current
+            )
+        if len(self._pending) >= self._max_pending:
+            logger.warning("Proof submission queue full, rejecting submitPlainProof")
+            return self._jsonrpc_error(-32000, "proof submission queue full", request_id)
+
+        plain_proof = PlainProof.from_base64(params["plain_proof"])
+        self._pending.append((plain_proof, mining_job))
+        self._pending_ready.set()
+        return self._jsonrpc_success("submitted", request_id)
+
+    def _current_header(self) -> bytes | None:
+        template = self.work_cache.current_template
+        return template.header.serialize_without_proof_commitment() if template else None
+
+    async def _consume_submissions(self) -> None:
+        """Process queued submissions one at a time (there is a single proving worker)."""
+        while True:
+            while not self._pending:
+                self._pending_ready.clear()
+                await self._pending_ready.wait()
+            plain_proof, mining_job = self._pending.popleft()
+            try:
+                await self.handle_submit_plain_proof(plain_proof, mining_job)
+            except Exception:
+                # Keep consuming: one bad submission must not stall the pipeline.
+                logger.exception("Error handling queued submission")
+
     async def handle_submit_plain_proof(
         self, plain_proof: PlainProof, mining_job: MiningJob
     ) -> None:
-        """Handle submitPlainProof requests."""
-        # Get the current template (needed to build the full block)
-        if self.work_cache.current_template is None:
-            raise MiningPausedError("no block template available")
-
-        logger.trace(f"Submitting plain proof for {mining_job.to_dict()=} and {plain_proof=}")
-
-        current_header_bytes = (
-            self.work_cache.current_template.header.serialize_without_proof_commitment()
-        )
-        if mining_job.incomplete_header_bytes != current_header_bytes:
-            logger.warning("Submitted block with old header. Skipping submission.")
+        """Handle a submission; re-checks the job is still current after the queue wait."""
+        template = self.work_cache.current_template
+        if template is None:
+            logger.info("No current job; dropping queued submission")
             return
 
+        logger.debug(f"Submitting plain proof for {mining_job.to_dict()=} and {plain_proof=}")
+
+        current_header = template.header.serialize_without_proof_commitment()
+        if mining_job.incomplete_header_bytes != current_header:
+            logger.info("Job changed since submission was queued; dropping stale proof")
+            return
+        if template.share_bits is not None:
+            # Pool mode: check what the proof achieved, not the target the miner
+            # searched against, so a proof that still meets a raised share target
+            # (or the network target) is kept. Cheap next to proving, and the
+            # binding holds the GIL, so a thread hop would not unblock the loop.
+            ok, msg = verify_plain_proof_for_cert_version(
+                int(template.required_cert_version),
+                IncompleteBlockHeader.from_bytes(current_header),
+                plain_proof,
+                nbits_override=template.share_bits,
+            )
+            if not ok:
+                logger.info(f"Proof does not meet the current share target; dropping: {msg}")
+                return
+
         # Submit the block via the submission service
-        result = await self.submission_service.submit_plain_proof(
-            plain_proof, self.work_cache.current_template
-        )
+        result = await self.submission_service.submit_plain_proof(plain_proof, template)
 
         logger.info(f"Block submission result: {result}")

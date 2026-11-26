@@ -62,16 +62,11 @@ func (msg *MsgInv) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) erro
 
 	// Create a contiguous slice of inventory vectors to deserialize into in
 	// order to reduce the number of allocations.
-	invList := make([]InvVect, count)
-	msg.InvList = make([]*InvVect, 0, count)
-	for i := uint64(0); i < count; i++ {
-		iv := &invList[i]
-		err := readInvVectBuf(r, pver, iv, buf)
-		if err != nil {
-			return err
-		}
-		msg.AddInvVect(iv)
+	invList, err := readRecords(r, count, maxInvVectPayload, decodeInvVect)
+	if err != nil {
+		return err
 	}
+	msg.InvList = toPointers(invList)
 
 	return nil
 }

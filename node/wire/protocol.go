@@ -12,7 +12,10 @@ import (
 
 const (
 	// ProtocolVersion is the latest protocol version this package supports.
-	ProtocolVersion uint32 = 2
+	//
+	// TODO: Increase it in the release that sets the mainnet FP8 fork height (chaincfg.MainNetParams.Fp8ForkHeight).
+	// Version 3 peers have no mainnet FP8 height, so a new version is what tells the two apart.
+	ProtocolVersion uint32 = 3
 )
 
 const (

@@ -14,6 +14,7 @@ def mock_pearl_gateway_components():
     with (
         patch("pearl_gateway.pearl_gateway.WorkCache") as mock_work_cache_cls,
         patch("pearl_gateway.pearl_gateway.PearlNodeClient") as mock_pearl_client_cls,
+        patch("pearl_gateway.pearl_gateway.ProofPool") as mock_proof_pool_cls,
         patch("pearl_gateway.pearl_gateway.SubmissionService") as mock_submission_service_cls,
         patch("pearl_gateway.pearl_gateway.MinerRpcServer") as mock_miner_rpc_cls,
         patch("pearl_gateway.pearl_gateway.TemplateScheduler") as mock_scheduler_cls,
@@ -24,6 +25,7 @@ def mock_pearl_gateway_components():
         mock_pearl_client = AsyncMock()
         mock_pearl_client.__aenter__ = AsyncMock(return_value=mock_pearl_client)
         mock_pearl_client.__aexit__ = AsyncMock(return_value=None)
+        mock_proof_pool = AsyncMock()
         mock_submission_service = AsyncMock()
         mock_miner_rpc = AsyncMock()
         mock_scheduler = AsyncMock()
@@ -32,6 +34,7 @@ def mock_pearl_gateway_components():
         # Configure class constructors to return our mocks
         mock_work_cache_cls.return_value = mock_work_cache
         mock_pearl_client_cls.return_value = mock_pearl_client
+        mock_proof_pool_cls.return_value = mock_proof_pool
         mock_submission_service_cls.return_value = mock_submission_service
         mock_miner_rpc_cls.return_value = mock_miner_rpc
         mock_scheduler_cls.return_value = mock_scheduler
@@ -40,6 +43,7 @@ def mock_pearl_gateway_components():
         yield {
             "work_cache": mock_work_cache,
             "pearl_client": mock_pearl_client,
+            "proof_pool": mock_proof_pool,
             "submission_service": mock_submission_service,
             "miner_rpc": mock_miner_rpc,
             "scheduler": mock_scheduler,
@@ -47,6 +51,7 @@ def mock_pearl_gateway_components():
             "classes": {
                 "WorkCache": mock_work_cache_cls,
                 "PearlNodeClient": mock_pearl_client_cls,
+                "ProofPool": mock_proof_pool_cls,
                 "SubmissionService": mock_submission_service_cls,
                 "MinerRpcServer": mock_miner_rpc_cls,
                 "TemplateScheduler": mock_scheduler_cls,
@@ -108,6 +113,7 @@ class TestPearlGateway:
         # Verify components are started in order
         mock_pearl_gateway_components["pearl_client"].__aenter__.assert_called_once()
         mock_pearl_gateway_components["scheduler"].start.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].start.assert_called_once()
         mock_pearl_gateway_components["miner_rpc"].start.assert_called_once()
 
         # Verify log messages
@@ -143,6 +149,7 @@ class TestPearlGateway:
 
         # Verify components are stopped in reverse order
         mock_pearl_gateway_components["miner_rpc"].stop.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
         mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once_with(
             None, None, None
@@ -235,8 +242,70 @@ class TestPearlGateway:
         # Verify all components were properly managed
         mock_pearl_gateway_components["pearl_client"].__aenter__.assert_called_once()
         mock_pearl_gateway_components["scheduler"].start.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].start.assert_called_once()
         mock_pearl_gateway_components["miner_rpc"].start.assert_called_once()
 
         mock_pearl_gateway_components["miner_rpc"].stop.assert_called_once()
+        mock_pearl_gateway_components["proof_pool"].stop.assert_called_once()
         mock_pearl_gateway_components["scheduler"].stop.assert_called_once()
         mock_pearl_gateway_components["pearl_client"].__aexit__.assert_called_once()
+
+
+class TestPearlGatewayPoolMode:
+    """POOL_STRATUM_URL switches the gateway to pool mode."""
+
+    @pytest.fixture
+    def pool_env(self, monkeypatch, mining_address):
+        monkeypatch.setenv("PEARLD_MINING_ADDRESS", mining_address)
+        monkeypatch.setenv("POOL_STRATUM_URL", "stratum+tcp://pool.example.com:3333")
+
+    @pytest.fixture
+    def pool_components(self, mock_pearl_gateway_components):
+        with (
+            patch("pearl_gateway.pearl_gateway.PoolStratumClient") as pool_client_cls,
+            patch("pearl_gateway.pearl_gateway.PoolSubmissionService") as pool_submission_cls,
+        ):
+            pool_client_cls.return_value = AsyncMock()
+            yield mock_pearl_gateway_components, pool_client_cls, pool_submission_cls
+
+    def test_pool_mode_wires_pool_components(self, pool_components, pool_env, mining_address):
+        mocks, pool_client_cls, pool_submission_cls = pool_components
+
+        gateway = PearlGateway(debug_mode=True)
+
+        # Payout address falls back to PEARLD_MINING_ADDRESS when POOL_ADDRESS is unset.
+        pool_client_cls.assert_called_once_with(
+            gateway.config.pool, mining_address, mocks["work_cache"]
+        )
+        pool_submission_cls.assert_called_once_with(
+            pool_client_cls.return_value, mocks["proof_pool"], mocks["work_cache"]
+        )
+        mocks["classes"]["PearlNodeClient"].assert_not_called()
+        mocks["classes"]["TemplateScheduler"].assert_not_called()
+        mocks["classes"]["SubmissionService"].assert_not_called()
+        assert gateway.pearl_client is None
+        assert gateway.scheduler is None
+
+    def test_pool_address_overrides_mining_address(self, pool_components, pool_env, monkeypatch):
+        _, pool_client_cls, _ = pool_components
+        monkeypatch.setenv("POOL_ADDRESS", "prl1payout")
+
+        gateway = PearlGateway()
+
+        assert pool_client_cls.call_args.args[1] == "prl1payout"
+        assert gateway.pool_client is pool_client_cls.return_value
+
+    async def test_pool_mode_start_and_stop(self, pool_components, pool_env):
+        mocks, pool_client_cls, _ = pool_components
+        pool_client = pool_client_cls.return_value
+
+        gateway = PearlGateway()
+        await gateway.start()
+        pool_client.start.assert_awaited_once()
+        mocks["proof_pool"].start.assert_awaited_once()
+        mocks["miner_rpc"].start.assert_awaited_once()
+        mocks["pearl_client"].__aenter__.assert_not_awaited()
+
+        await gateway.stop()
+        pool_client.stop.assert_awaited_once()
+        mocks["pearl_client"].__aexit__.assert_not_awaited()

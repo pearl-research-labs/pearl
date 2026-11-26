@@ -242,10 +242,11 @@ pub fn verify_stark_proof_with_challenges_circuit<
     // Used to check if we want to skip a Fri query step.
     let degree_sub_one_bits_vec = builder.split_le(degree_sub_one, degree_bits);
 
+    let zero = builder.zero();
     if let Some(min_degree_bits_to_support) = min_degree_bits_to_support {
         builder.verify_fri_proof_with_multiple_degree_bits::<C>(
             &fri_instance,
-            &proof.openings.to_fri_openings(),
+            &proof.openings.to_fri_openings(zero),
             &challenges.fri_challenges,
             &merkle_caps,
             &proof.opening_proof,
@@ -257,7 +258,7 @@ pub fn verify_stark_proof_with_challenges_circuit<
     } else {
         builder.verify_fri_proof::<C>(
             &fri_instance,
-            &proof.openings.to_fri_openings(),
+            &proof.openings.to_fri_openings(zero),
             &challenges.fri_challenges,
             &merkle_caps,
             &proof.opening_proof,
@@ -427,10 +428,55 @@ where
         witness.set_cap_target(quotient_polys_cap_target, quotient_polys_cap)?;
     }
 
-    witness.set_fri_openings(
-        &proof_target.openings.to_fri_openings(),
-        &proof.openings.to_fri_openings(),
-    )?;
+    // Set the opening targets directly (rather than via `to_fri_openings`, whose circuit
+    // version requires a zero `Target` to lift `ctl_zs_first` to extension targets).
+    let ot = &proof_target.openings;
+    let os = &proof.openings;
+    for (&t, &v) in ot.local_values.iter().zip_eq(&os.local_values) {
+        witness.set_extension_target(t, v)?;
+    }
+    for (&t, &v) in ot.next_values.iter().zip_eq(&os.next_values) {
+        witness.set_extension_target(t, v)?;
+    }
+    debug_assert_eq!(ot.auxiliary_polys.is_some(), os.auxiliary_polys.is_some());
+    for (&t, &v) in ot
+        .auxiliary_polys
+        .iter()
+        .flatten()
+        .zip_eq(os.auxiliary_polys.iter().flatten())
+    {
+        witness.set_extension_target(t, v)?;
+    }
+    debug_assert_eq!(
+        ot.auxiliary_polys_next.is_some(),
+        os.auxiliary_polys_next.is_some()
+    );
+    for (&t, &v) in ot
+        .auxiliary_polys_next
+        .iter()
+        .flatten()
+        .zip_eq(os.auxiliary_polys_next.iter().flatten())
+    {
+        witness.set_extension_target(t, v)?;
+    }
+    debug_assert_eq!(ot.ctl_zs_first.is_some(), os.ctl_zs_first.is_some());
+    for (&t, &v) in ot
+        .ctl_zs_first
+        .iter()
+        .flatten()
+        .zip_eq(os.ctl_zs_first.iter().flatten())
+    {
+        witness.set_target(t, v)?;
+    }
+    debug_assert_eq!(ot.quotient_polys.is_some(), os.quotient_polys.is_some());
+    for (&t, &v) in ot
+        .quotient_polys
+        .iter()
+        .flatten()
+        .zip_eq(os.quotient_polys.iter().flatten())
+    {
+        witness.set_extension_target(t, v)?;
+    }
 
     if let (Some(auxiliary_polys_cap_target), Some(auxiliary_polys_cap)) = (
         &proof_target.auxiliary_polys_cap,

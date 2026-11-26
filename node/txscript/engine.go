@@ -495,7 +495,7 @@ func (vm *Engine) verifyTaprootSpend(witness wire.TxWitness) error {
 	// than one element means the last element is a control block and
 	// we're doing a tapscript leaf (script-path) spend.
 	if len(stack) == 1 {
-		return vm.verifyTaprootKeyPath(stack[0])
+		return vm.verifyTaprootKeyPath(stack[0], annex)
 	}
 
 	controlBlock, err := ParseControlBlock(stack[len(stack)-1])
@@ -519,9 +519,9 @@ func (vm *Engine) verifyTaprootSpend(witness wire.TxWitness) error {
 // verifyTaprootKeyPath handles a Taproot key-path spend: verify the top-level
 // Schnorr signature against the output key (which is the witness program),
 // then leave a clean single-true stack so CheckErrorCondition passes.
-func (vm *Engine) verifyTaprootKeyPath(rawSig []byte) error {
-	if err := VerifyTaprootKeySpend(
-		vm.witnessProgram, rawSig, &vm.tx, vm.txIdx,
+func (vm *Engine) verifyTaprootKeyPath(rawSig, annex []byte) error {
+	if err := verifyTaprootKeySpendWithAnnex(
+		vm.witnessProgram, rawSig, annex, &vm.tx, vm.txIdx,
 		vm.prevOutFetcher, vm.hashCache, vm.sigCache,
 	); err != nil {
 		return err
@@ -811,7 +811,7 @@ func (vm *Engine) Step() (done bool, err error) {
 	// If a witness program was detected by NewEngine, validate the witness
 	// and append the tapscript leaf as vm.scripts[2] for execution.
 	if vm.scriptIdx == 2 && vm.witnessProgram != nil {
-		witness := vm.tx.TxIn[vm.txIdx].Witness
+		witness := vm.tx.TxIn[vm.txIdx].DecodeWitness()
 		if err := vm.verifyWitnessProgram(witness); err != nil {
 			return false, err
 		}
@@ -1110,7 +1110,7 @@ func NewEngine(scriptPubKey []byte, tx *wire.MsgTx, txIdx int, flags ScriptFlags
 	} else {
 		// If the pkScript is not a witness program, there MUST NOT be
 		// any witness data associated with the input.
-		if len(tx.TxIn[txIdx].Witness) != 0 {
+		if tx.TxIn[txIdx].HasWitness() {
 			errStr := "non-witness inputs cannot have a witness"
 			return nil, scriptError(ErrWitnessUnexpected, errStr)
 		}

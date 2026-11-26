@@ -99,71 +99,6 @@ type expectedAddr struct {
 	scriptNotSecret bool
 }
 
-// computeExpectedAddrsNoXMSS computes expected addresses without tapscript commitment.
-// This is used for watch-only wallets where XMSS keys cannot be derived.
-func computeExpectedAddrsNoXMSS(tc *testContext, branch uint32) []expectedAddr {
-	tc.t.Helper()
-	result := make([]expectedAddr, 5)
-	for i := uint32(0); i < 5; i++ {
-		result[i] = deriveTestAddr(tc.t, tc.manager.ChainParams(), branch, i)
-	}
-	return result
-}
-
-// deriveTestAddr derives a single expected address from the test rootKey at the given path.
-func deriveTestAddr(t *testing.T, chainParams *chaincfg.Params, branch, index uint32) expectedAddr {
-	t.Helper()
-
-	// Derive key at m/86'/coin'/0'/branch/index
-	key := deriveTestKey(t, chainParams, branch, index)
-
-	pubKey, err := key.ECPubKey()
-	require.NoError(t, err)
-
-	privKey, err := key.ECPrivKey()
-	require.NoError(t, err)
-
-	taprootKey := txscript.ComputeTaprootKeyNoScript(pubKey)
-	addr, err := btcutil.NewAddressTaproot(schnorr.SerializePubKey(taprootKey), chainParams)
-	require.NoError(t, err)
-
-	return expectedAddr{
-		address:     addr.String(),
-		addressHash: schnorr.SerializePubKey(taprootKey),
-		internal:    branch == InternalBranch,
-		compressed:  true,
-		pubKey:      pubKey.SerializeCompressed(),
-		privKey:     privKey.Serialize(),
-		derivationInfo: DerivationPath{
-			InternalAccount: 0,
-			Account:         hdkeychain.HardenedKeyStart,
-			Branch:          branch,
-			Index:           index,
-		},
-	}
-}
-
-// deriveTestKey derives the key at m/86'/coin'/0'/branch/index from the test rootKey.
-func deriveTestKey(t *testing.T, chainParams *chaincfg.Params, branch, index uint32) *hdkeychain.ExtendedKey {
-	t.Helper()
-
-	path := []uint32{
-		86 + hdkeychain.HardenedKeyStart,                     // purpose
-		chainParams.HDCoinType + hdkeychain.HardenedKeyStart, // coin
-		hdkeychain.HardenedKeyStart,                          // account 0'
-		branch,
-		index,
-	}
-
-	key := rootKey
-	for _, child := range path {
-		var err error
-		key, err = key.Derive(child)
-		require.NoError(t, err)
-	}
-	return key
-}
-
 // testNamePrefix is a helper to return a prefix to show for test errors based
 // on the state of the test context.
 func testNamePrefix(tc *testContext) string {
@@ -423,7 +358,7 @@ func testExternalAddresses(tc *testContext) bool {
 			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 			var err error
 			addrs, err = tc.manager.NextExternalAddresses(
-				ns, tc.internalAccount, 5, false,
+				ns, tc.internalAccount, 5,
 			)
 			return err
 		})
@@ -576,15 +511,6 @@ func testInternalAddresses(tc *testContext) bool {
 		tc.unlocked = true
 	}
 
-	// For watch-only wallets, addresses won't have XMSS commitment since
-	// private keys aren't available to derive XMSS. Compute expected
-	// addresses accordingly.
-	expectedAddrsToUse := expectedInternalAddrs
-	if tc.watchingOnly {
-		// Watch-only: compute addresses without XMSS (like external addresses)
-		expectedAddrsToUse = computeExpectedAddrsNoXMSS(tc, InternalBranch)
-	}
-
 	prefix := testNamePrefix(tc) + " testInternalAddresses"
 	var addrs []ManagedAddress
 	if tc.create {
@@ -593,7 +519,7 @@ func testInternalAddresses(tc *testContext) bool {
 			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 			var err error
 			addrs, err = tc.manager.NextInternalAddresses(
-				ns, tc.internalAccount, 5, false,
+				ns, tc.internalAccount, 5,
 			)
 			return err
 		})
@@ -601,10 +527,10 @@ func testInternalAddresses(tc *testContext) bool {
 			tc.t.Errorf("%s: unexpected error: %v", prefix, err)
 			return false
 		}
-		if len(addrs) != len(expectedAddrsToUse) {
+		if len(addrs) != len(expectedInternalAddrs) {
 			tc.t.Errorf("%s: unexpected number of addresses - got "+
 				"%d, want %d", prefix, len(addrs),
-				len(expectedAddrsToUse))
+				len(expectedInternalAddrs))
 			return false
 		}
 	}
@@ -618,7 +544,7 @@ func testInternalAddresses(tc *testContext) bool {
 		// of the tests.
 		for i := 0; i < len(addrs); i++ {
 			prefix := fmt.Sprintf("%s InternalAddress #%d", prefix, i)
-			if !testAddress(tc, prefix, addrs[i], &expectedAddrsToUse[i]) {
+			if !testAddress(tc, prefix, addrs[i], &expectedInternalAddrs[i]) {
 				return false
 			}
 		}
@@ -638,17 +564,17 @@ func testInternalAddresses(tc *testContext) bool {
 			tc.t.Errorf("%s: unexpected error: %v", liaPrefix, err)
 			return false
 		}
-		if !testAddress(tc, liaPrefix, lastAddr, &expectedAddrsToUse[len(expectedAddrsToUse)-1]) {
+		if !testAddress(tc, liaPrefix, lastAddr, &expectedInternalAddrs[len(expectedInternalAddrs)-1]) {
 			return false
 		}
 
 		// Now, use the Address API to retrieve each of the expected new
 		// addresses and ensure they're accurate.
 		chainParams := tc.manager.ChainParams()
-		for i := 0; i < len(expectedAddrsToUse); i++ {
+		for i := 0; i < len(expectedInternalAddrs); i++ {
 			// Parse the expected address string directly for lookup
 			utilAddr, err := btcutil.DecodeAddress(
-				expectedAddrsToUse[i].address, chainParams,
+				expectedInternalAddrs[i].address, chainParams,
 			)
 			if err != nil {
 				tc.t.Errorf("%s DecodeAddress #%d: "+
@@ -670,7 +596,7 @@ func testInternalAddresses(tc *testContext) bool {
 				return false
 			}
 
-			if !testAddress(tc, prefix, addr, &expectedAddrsToUse[i]) {
+			if !testAddress(tc, prefix, addr, &expectedInternalAddrs[i]) {
 				return false
 			}
 		}
@@ -2243,7 +2169,7 @@ func TestScopedKeyManagerManagement(t *testing.T) {
 			}
 
 			externalAddr, err := sMgr.NextExternalAddresses(
-				ns, DefaultAccountNum, 1, true,
+				ns, DefaultAccountNum, 1,
 			)
 			if err != nil {
 				t.Fatalf("unable to derive external addr: %v", err)
@@ -2258,7 +2184,7 @@ func TestScopedKeyManagerManagement(t *testing.T) {
 			}
 
 			internalAddr, err := sMgr.NextInternalAddresses(
-				ns, DefaultAccountNum, 1, true,
+				ns, DefaultAccountNum, 1,
 			)
 			if err != nil {
 				t.Fatalf("unable to derive internal addr: %v", err)
@@ -2325,14 +2251,14 @@ func TestScopedKeyManagerManagement(t *testing.T) {
 		// We'll now create a new external address to ensure we
 		// retrieve the proper type.
 		externalAddr, err = scopedMgr.NextExternalAddresses(
-			ns, DefaultAccountNum, 1, true,
+			ns, DefaultAccountNum, 1,
 		)
 		if err != nil {
 			t.Fatalf("unable to derive external addr: %v", err)
 		}
 
 		internalAddr, err = scopedMgr.NextInternalAddresses(
-			ns, DefaultAccountNum, 1, true,
+			ns, DefaultAccountNum, 1,
 		)
 		if err != nil {
 			t.Fatalf("unable to derive internal addr: %v", err)
@@ -2589,7 +2515,7 @@ func TestNewRawAccount(t *testing.T) {
 		t.Fatalf("unable to create new account: %v", err)
 	}
 
-	testNewRawAccount(t, mgr, db, accountNum, scopedMgr, false)
+	testNewRawAccount(t, mgr, db, accountNum, scopedMgr)
 }
 
 // TestNewRawAccountWatchingOnly tests that callers are able to
@@ -2656,7 +2582,7 @@ func TestNewRawAccountWatchingOnly(t *testing.T) {
 		t.Fatalf("unable to create new account: %v", err)
 	}
 
-	testNewRawAccount(t, mgr, db, accountNum, scopedMgr, false)
+	testNewRawAccount(t, mgr, db, accountNum, scopedMgr)
 }
 
 // TestNewRawAccountHybrid is similar to TestNewRawAccountWatchingOnly
@@ -2723,11 +2649,11 @@ func TestNewRawAccountHybrid(t *testing.T) {
 		t.Fatalf("unable to create new account: %v", err)
 	}
 
-	testNewRawAccount(t, mgr, db, accountNum, scopedMgr, false)
+	testNewRawAccount(t, mgr, db, accountNum, scopedMgr)
 }
 
 func testNewRawAccount(t *testing.T, _ *Manager, db walletdb.DB,
-	accountNum uint32, scopedMgr *ScopedKeyManager, includePQTapscript bool) {
+	accountNum uint32, scopedMgr *ScopedKeyManager) {
 	// With the account created, we should be able to derive new addresses
 	// from the account.
 	var accountAddrNext ManagedAddress
@@ -2735,7 +2661,7 @@ func testNewRawAccount(t *testing.T, _ *Manager, db walletdb.DB,
 		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		addrs, err := scopedMgr.NextExternalAddresses(
-			ns, accountNum, 1, includePQTapscript,
+			ns, accountNum, 1,
 		)
 		if err != nil {
 			return err
@@ -2761,7 +2687,7 @@ func testNewRawAccount(t *testing.T, _ *Manager, db walletdb.DB,
 			Index:           0,
 		}
 		accountTargetAddr, err = scopedMgr.DeriveFromKeyPath(
-			ns, keyPath, includePQTapscript,
+			ns, keyPath,
 		)
 		return err
 	})
@@ -2844,7 +2770,7 @@ func TestDeriveFromKeyPathCache(t *testing.T) {
 		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 
 		managedAddr, err := scopedMgr.DeriveFromKeyPath(
-			ns, keyPath, true,
+			ns, keyPath,
 		)
 		if err != nil {
 			return err
@@ -2934,56 +2860,58 @@ func TestTaprootPubKeyDerivation(t *testing.T) {
 		Index:           0,
 	}
 
-	// Note: Expected addresses are empty because XMSS commitment changes the address
-	// from standard BIP-86 test vectors. The test validates derivation and marking work.
+	const (
+		expectedExternal = "prl1pr6yuq8u2r95wjzzgpdy8cpnncpl7l8zgy6x5q0367pnc53s2famqg7pt74"
+		expectedInternal = "prl1puwagcza86exfh3cx6ur08wq7njc32e66ep0zje7le6c7cak8lqeq655gqa"
+	)
 	assertAddressDerivation(
 		t, db, func(ns walletdb.ReadWriteBucket) (ManagedAddress, error) {
-			return scopedMgr.DeriveFromKeyPath(ns, externalPath, true)
+			return scopedMgr.DeriveFromKeyPath(ns, externalPath)
 		},
-		"", // Skip address check - XMSS commitment changes the address
+		expectedExternal,
 		scopedMgr,
 	)
 	assertAddressDerivation(
 		t, db, func(ns walletdb.ReadWriteBucket) (ManagedAddress, error) {
-			addrs, err := scopedMgr.NextExternalAddresses(ns, 0, 1, true)
+			addrs, err := scopedMgr.NextExternalAddresses(ns, 0, 1)
 			if err != nil {
 				return nil, err
 			}
 			return addrs[0], nil
 		},
-		"", // Skip address check
+		expectedExternal,
 		scopedMgr,
 	)
 	assertAddressDerivation(
 		t, db, func(ns walletdb.ReadWriteBucket) (ManagedAddress, error) {
 			return scopedMgr.LastExternalAddress(ns, 0)
 		},
-		"", // Skip address check
+		expectedExternal,
 		scopedMgr,
 	)
 	assertAddressDerivation(
 		t, db, func(ns walletdb.ReadWriteBucket) (ManagedAddress, error) {
-			return scopedMgr.DeriveFromKeyPath(ns, internalPath, true)
+			return scopedMgr.DeriveFromKeyPath(ns, internalPath)
 		},
-		"", // Skip address check
+		expectedInternal,
 		scopedMgr,
 	)
 	assertAddressDerivation(
 		t, db, func(ns walletdb.ReadWriteBucket) (ManagedAddress, error) {
-			addrs, err := scopedMgr.NextInternalAddresses(ns, 0, 1, true)
+			addrs, err := scopedMgr.NextInternalAddresses(ns, 0, 1)
 			if err != nil {
 				return nil, err
 			}
 			return addrs[0], nil
 		},
-		"", // Skip address check
+		expectedInternal,
 		scopedMgr,
 	)
 	assertAddressDerivation(
 		t, db, func(ns walletdb.ReadWriteBucket) (ManagedAddress, error) {
 			return scopedMgr.LastInternalAddress(ns, 0)
 		},
-		"", // Skip address check
+		expectedInternal,
 		scopedMgr,
 	)
 }
@@ -3004,11 +2932,7 @@ func assertAddressDerivation(t *testing.T, db walletdb.DB,
 	})
 	require.NoError(t, err, "unable to derive addr: %v", err)
 
-	// Only verify expected address if provided (empty means skip check)
-	// This is useful when XMSS commitment changes the address from BIP-86 test vectors
-	if expectedAddr != "" {
-		require.Equal(t, expectedAddr, address.Address().String())
-	}
+	require.Equal(t, expectedAddr, address.Address().String())
 
 	// Also make sure marking addresses as used works correctly.
 	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
@@ -3026,55 +2950,6 @@ func assertAddressDerivation(t *testing.T, db walletdb.DB,
 		return nil
 	})
 	require.NoError(t, err)
-}
-
-// TestPQAddressErrorsWhenLockedOrWatchOnly tests that a new PQ address is
-// refused when the manager is locked or watching-only, instead of silently
-// dropping the XMSS commitment, while re-deriving a known path still works.
-func TestPQAddressErrorsWhenLockedOrWatchOnly(t *testing.T) {
-	t.Parallel()
-
-	teardown, db, mgr := setupManager(t)
-	defer teardown()
-
-	scopedMgr, err := mgr.FetchScopedKeyManager(KeyScopeBIP0086)
-	require.NoError(t, err)
-
-	path := DerivationPath{
-		InternalAccount: DefaultAccountNum,
-		Account:         hdkeychain.HardenedKeyStart,
-		Branch:          ExternalBranch,
-		Index:           0,
-	}
-
-	assertPQ := func(name string, wantErr ErrorCode) {
-		t.Helper()
-
-		err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-			_, err := scopedMgr.NextExternalAddresses(ns, 0, 1, true)
-			checkManagerError(t, name, err, wantErr)
-
-			// Must keep working: recovery re-derives known paths
-			// with the PQ flag set while locked.
-			_, err = scopedMgr.DeriveFromKeyPath(ns, path, true)
-			return err
-		})
-		require.NoError(t, err, "%s: DeriveFromKeyPath", name)
-	}
-
-	require.True(t, mgr.IsLocked())
-	assertPQ("locked", ErrLocked)
-
-	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		return mgr.ConvertToWatchingOnly(
-			tx.ReadWriteBucket(waddrmgrNamespaceKey),
-		)
-	})
-	require.NoError(t, err)
-
-	assertPQ("watching-only", ErrWatchingOnly)
 }
 
 // TestManagedAddressValidation tests that we're able to properly detect and
@@ -3186,7 +3061,7 @@ func TestManagedAddressValidation(t *testing.T) {
 				err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
 					ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 					addrs, err := scopedMgr.NextExternalAddresses(
-						ns, 0, 1, true,
+						ns, 0, 1,
 					)
 					if err != nil {
 						return err
@@ -3243,7 +3118,7 @@ func TestLockUnlockRace(t *testing.T) {
 			_ = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
 				ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 				_, err := scopedMgr.NextExternalAddresses(
-					ns, 0, 1, false,
+					ns, 0, 1,
 				)
 				return err
 			})
@@ -3263,4 +3138,132 @@ func TestLockUnlockRace(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestExtendAddressesUnlocked tests that addresses extended while the manager
+// is unlocked keep their private keys, and that a watch-only account in the
+// same manager is extended from its public key.
+func TestExtendAddressesUnlocked(t *testing.T) {
+	t.Parallel()
+
+	teardown, db, mgr := setupManager(t)
+	defer teardown()
+
+	err := walletdb.View(db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		return mgr.Unlock(ns, privPassphrase)
+	})
+	require.NoError(t, err)
+
+	scopedMgr, err := mgr.FetchScopedKeyManager(KeyScopeBIP0086)
+	require.NoError(t, err)
+
+	t.Run("default account", func(t *testing.T) {
+		want := expectedExternalAddrs[1]
+		addr, err := btcutil.DecodeAddress(want.address, &chaincfg.MainNetParams)
+		require.NoError(t, err)
+
+		var privKey *btcec.PrivateKey
+		err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+			err := scopedMgr.ExtendExternalAddresses(ns, DefaultAccountNum, 1)
+			if err != nil {
+				return err
+			}
+
+			ma, err := scopedMgr.Address(ns, addr)
+			if err != nil {
+				return err
+			}
+			privKey, err = ma.(ManagedPubKeyAddress).PrivKey()
+			return err
+		})
+		require.NoError(t, err)
+		require.Equal(t, want.privKey, privKey.Serialize())
+	})
+
+	t.Run("watch-only account", func(t *testing.T) {
+		accountKey := deriveTestAccountKey(t)
+		require.NotNil(t, accountKey)
+		acctKeyPub, err := accountKey.Neuter()
+		require.NoError(t, err)
+
+		const watchOnlyAccount = 1000
+		err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+			ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+			err := scopedMgr.NewRawAccountWatchingOnly(
+				ns, watchOnlyAccount, acctKeyPub, 0, nil,
+			)
+			if err != nil {
+				return err
+			}
+
+			return scopedMgr.ExtendExternalAddresses(ns, watchOnlyAccount, 0)
+		})
+		require.NoError(t, err)
+	})
+}
+
+// TestUnlockWithWatchOnlyAccount tests that a manager holding a cached
+// watch-only account can be unlocked, and that unlocking still derives the
+// pending private keys of its other accounts.
+func TestUnlockWithWatchOnlyAccount(t *testing.T) {
+	t.Parallel()
+
+	teardown, db, mgr := setupManager(t)
+	defer teardown()
+
+	scopedMgr, err := mgr.FetchScopedKeyManager(KeyScopeBIP0086)
+	require.NoError(t, err)
+
+	accountKey := deriveTestAccountKey(t)
+	require.NotNil(t, accountKey)
+	acctKeyPub, err := accountKey.Neuter()
+	require.NoError(t, err)
+
+	const watchOnlyAccount = 1000
+	watchOnlyPath := DerivationPath{
+		InternalAccount: watchOnlyAccount,
+		Account:         hdkeychain.HardenedKeyStart,
+		Branch:          ExternalBranch,
+		Index:           0,
+	}
+
+	var lockedAddr ManagedAddress
+	err = walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+		err := scopedMgr.NewRawAccountWatchingOnly(
+			ns, watchOnlyAccount, acctKeyPub, 0, nil,
+		)
+		if err != nil {
+			return err
+		}
+		if _, err := scopedMgr.DeriveFromKeyPath(ns, watchOnlyPath); err != nil {
+			return err
+		}
+
+		addrs, err := scopedMgr.NextExternalAddresses(ns, DefaultAccountNum, 1)
+		if err != nil {
+			return err
+		}
+		lockedAddr = addrs[0]
+		return nil
+	})
+	require.NoError(t, err)
+
+	err = walletdb.View(db, func(tx walletdb.ReadTx) error {
+		ns := tx.ReadBucket(waddrmgrNamespaceKey)
+		return mgr.Unlock(ns, privPassphrase)
+	})
+	require.NoError(t, err)
+
+	privKey, err := lockedAddr.(ManagedPubKeyAddress).PrivKey()
+	require.NoError(t, err)
+	require.Equal(t, expectedExternalAddrs[0].privKey, privKey.Serialize())
+
+	_, err = scopedMgr.DeriveFromKeyPathCache(watchOnlyPath)
+	require.ErrorIs(t, err, hdkeychain.ErrNotPrivExtKey)
 }

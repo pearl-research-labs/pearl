@@ -110,7 +110,7 @@ func (msg *MsgBlock) PrlDecode(r io.Reader, pver uint32, enc MessageEncoding) er
 	scriptBuf := scriptPool.Borrow()
 	defer scriptPool.Return(scriptBuf)
 
-	msg.Transactions = make([]*MsgTx, 0, txCount)
+	msg.Transactions = make([]*MsgTx, 0, capHint(r, txCount, minTxPayload))
 	for i := uint64(0); i < txCount; i++ {
 		tx := MsgTx{}
 		err := tx.prlDecode(r, pver, enc, buf, scriptBuf[:])
@@ -188,17 +188,17 @@ func (msg *MsgBlock) DeserializeTxLoc(r *bytes.Buffer) ([]TxLoc, error) {
 
 	// Deserialize each transaction while keeping track of its location
 	// within the byte stream.
-	msg.Transactions = make([]*MsgTx, 0, txCount)
-	txLocs := make([]TxLoc, txCount)
+	msg.Transactions = make([]*MsgTx, 0, capHint(r, txCount, minTxPayload))
+	txLocs := make([]TxLoc, 0, capHint(r, txCount, minTxPayload))
 	for i := uint64(0); i < txCount; i++ {
-		txLocs[i].TxStart = fullLen - r.Len()
+		txStart := fullLen - r.Len()
 		tx := MsgTx{}
 		err := tx.prlDecode(r, 0, WitnessEncoding, buf, scriptBuf[:])
 		if err != nil {
 			return nil, err
 		}
 		msg.Transactions = append(msg.Transactions, &tx)
-		txLocs[i].TxLen = (fullLen - r.Len()) - txLocs[i].TxStart
+		txLocs = append(txLocs, TxLoc{TxStart: txStart, TxLen: (fullLen - r.Len()) - txStart})
 	}
 
 	return txLocs, nil
@@ -335,6 +335,8 @@ func (msg *MsgBlock) MaxPayloadLength(pver uint32) uint32 {
 	// Wire body = certificate + block header + varint + transactions.
 	// Bound the block to MaxBlockPayload and additionally reserve
 	// CertificateMaxSize for the certificate that rides in the header.
+	// Every certificate version is capped at CertificateMaxSize, so this
+	// ensures any valid block can be relayed.
 	return MaxBlockPayload + CertificateMaxSize
 }
 

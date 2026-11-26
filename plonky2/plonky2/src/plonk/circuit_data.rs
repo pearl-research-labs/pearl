@@ -112,6 +112,7 @@ impl CircuitConfig {
                 rate_bits: 3,
                 cap_height: 4,
                 proof_of_work_bits: 16,
+                batching_proof_of_work_bits: 0,
                 reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
                 num_query_rounds: 28,
             },
@@ -186,6 +187,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> IoResult<Self> {
         let mut buffer = Buffer::new(bytes);
         buffer.read_circuit_data(gate_serializer, generator_serializer)
+    }
+
+    /// Like [`Self::prove`], but reports its sub-phase timings into `timing`,
+    /// so a parent (e.g. a wrapper prover) can attribute wrapper cost.
+    pub fn prove_with_timing(
+        &self,
+        inputs: PartialWitness<F>,
+        timing: &mut TimingTree,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        prove::<F, C, D>(&self.prover_only, &self.common, inputs, timing)
     }
 
     pub fn prove(&self, inputs: PartialWitness<F>) -> Result<ProofWithPublicInputs<F, C, D>> {

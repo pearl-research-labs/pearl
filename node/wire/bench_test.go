@@ -1095,3 +1095,78 @@ func BenchmarkDoubleHashH(b *testing.B) {
 		_ = chainhash.DoubleHashH(txBytes)
 	}
 }
+
+// BenchmarkDeserializeStandardTx measures decoding time and allocations for transactions the mempool accepts, from a
+// small payment up to the largest standard size, including one built to carry as many empty witness items as it can.
+func BenchmarkDeserializeStandardTx(b *testing.B) {
+	// standardTxWeight is the most weight the mempool accepts in one transaction, 4 * mempool.maxStandardTxVsize.
+	const standardTxWeight = 400_000
+
+	p2tr := append([]byte{0x51, 0x20}, make([]byte, 32)...)
+	sig := make([]byte, 64)
+	controlBlock := make([]byte, 33)
+	keyPath := [][]byte{sig}
+
+	// A 2-of-3 CHECKSIGADD multisig script path spend, with an empty item for the missing signature.
+	multisig := [][]byte{sig, {}, sig, make([]byte, 105), controlBlock}
+
+	// An inscription style spend: one large leaf script that carries the data.
+	largeItem := [][]byte{sig, make([]byte, 390_000), controlBlock}
+
+	// A script path spend with the most items consensus allows: 1000 empty stack items, a leaf script that drops
+	// them (500 OP_2DROP and OP_TRUE) and the control block.
+	emptyItems := append(make([][]byte, 1000), make([]byte, 501), controlBlock)
+
+	tests := []struct {
+		name string
+		// witnesses holds one witness per input. When fill is set, inputs spending with it are added for as long
+		// as the transaction stays within standardTxWeight.
+		witnesses [][][]byte
+		fill      [][]byte
+	}{
+		{name: "small", witnesses: [][][]byte{keyPath}},
+		{name: "regular", witnesses: [][][]byte{keyPath, keyPath, multisig}},
+		{name: "large many inputs", fill: keyPath},
+		{name: "large one item", witnesses: [][][]byte{largeItem}},
+		{name: "adversarial empty items", fill: emptyItems},
+	}
+	for _, test := range tests {
+		tx := NewMsgTx(2)
+		tx.AddTxOut(NewTxOut(1000, p2tr))
+		tx.AddTxOut(NewTxOut(1000, p2tr))
+		var items int
+		for _, w := range test.witnesses {
+			tx.AddTxIn(NewTxIn(&OutPoint{Index: uint32(len(tx.TxIn))}, nil, w))
+			items += len(w)
+		}
+		for test.fill != nil {
+			tx.AddTxIn(NewTxIn(&OutPoint{Index: uint32(len(tx.TxIn))}, nil, test.fill))
+			if tx.SerializeSizeStripped()*3+tx.SerializeSize() > standardTxWeight {
+				tx.TxIn = tx.TxIn[:len(tx.TxIn)-1]
+
+				break
+			}
+			items += len(test.fill)
+		}
+
+		var buf bytes.Buffer
+		if err := tx.Serialize(&buf); err != nil {
+			b.Fatal(err)
+		}
+
+		b.Run(test.name, func(b *testing.B) {
+			b.ReportAllocs()
+			b.SetBytes(int64(buf.Len()))
+			r := bytes.NewReader(buf.Bytes())
+			for b.Loop() {
+				r.Reset(buf.Bytes())
+				var decoded MsgTx
+				if err := decoded.Deserialize(r); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.ReportMetric(float64(len(tx.TxIn)), "inputs")
+			b.ReportMetric(float64(items), "items")
+		})
+	}
+}

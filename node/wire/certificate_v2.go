@@ -6,18 +6,17 @@ package wire
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
 
 	"github.com/pearl-research-labs/pearl/node/chaincfg/chainhash"
 )
 
 // PublicDataMaxSizeV2 is the maximum PublicData size for V2 certificates.
-// Must match PublicProofParams::MAX_WIRE_SIZE in zk-pow/src/api/proof_utils.rs.
+// Must match PublicProofParams::MAX_WIRE_SIZE in zk-pow/src/v2/api/proof_utils.rs.
 const PublicDataMaxSizeV2 = 4807
 
 // PublicDataSizeDenseV2 is the exact PublicData size of a dense (non-MoE) V2
-// proof. Must match PublicProofParams::WIRE_SIZE in zk-pow/src/api/proof_utils.rs;
+// proof. Must match PublicProofParams::WIRE_SIZE in zk-pow/src/v2/api/proof_utils.rs;
 // MoE proofs are strictly longer.
 const PublicDataSizeDenseV2 = 164
 
@@ -79,6 +78,12 @@ func proofCommitment(version CertificateVersion, publicData []byte) chainhash.Ha
 // Serialize: BlockHash(32) + PublicDataLen(4) + PublicData(PublicDataLen) + ProofLen(4) + ProofData
 // Version excluded - handled by MsgCertificate.
 func (c *CertificateV2) Serialize(w io.Writer) error {
+	if err := checkBlobLen("public_data", c.PublicDataLen, PublicDataMaxSizeV2); err != nil {
+		return err
+	}
+	if err := checkBlobLen("proof_data", len(c.ProofData), MaxZKProofSize); err != nil {
+		return err
+	}
 	if _, err := w.Write(c.Hash[:]); err != nil {
 		return err
 	}
@@ -106,8 +111,8 @@ func (c *CertificateV2) Deserialize(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &c.PublicDataLen); err != nil {
 		return err
 	}
-	if c.PublicDataLen > PublicDataMaxSizeV2 {
-		return fmt.Errorf("public_data_len %d exceeds max %d", c.PublicDataLen, PublicDataMaxSizeV2)
+	if err := checkBlobLen("public_data", c.PublicDataLen, PublicDataMaxSizeV2); err != nil {
+		return err
 	}
 	if _, err := io.ReadFull(r, c.PublicData[:c.PublicDataLen]); err != nil {
 		return err
@@ -117,8 +122,8 @@ func (c *CertificateV2) Deserialize(r io.Reader) error {
 	if err := binary.Read(r, binary.LittleEndian, &proofLen); err != nil {
 		return err
 	}
-	if proofLen > MaxZKProofSize {
-		return fmt.Errorf("proof data too large: %d bytes (max %d)", proofLen, MaxZKProofSize)
+	if err := checkBlobLen("proof_data", proofLen, MaxZKProofSize); err != nil {
+		return err
 	}
 	c.ProofData = make([]byte, proofLen)
 	if _, err := io.ReadFull(r, c.ProofData); err != nil {

@@ -68,5 +68,7 @@ func (s *SigCache) Exists(sigHash chainhash.Hash, sig []byte, pubKey []byte) boo
 // NOTE: This function is safe for concurrent access. Writers will block
 // simultaneous readers until function execution has concluded.
 func (s *SigCache) Add(sigHash chainhash.Hash, sig []byte, pubKey []byte) {
-	s.validSigs.put(sigHash, sigCacheEntry{sig, pubKey})
+	// Copy sig and pubKey. Callers pass slices of a transaction's witness, and keeping those would hold the whole
+	// decoded witness in memory for as long as the entry lives, even after the transaction is rejected.
+	s.validSigs.put(sigHash, sigCacheEntry{bytes.Clone(sig), bytes.Clone(pubKey)})
 }

@@ -405,7 +405,7 @@ func (g *testGenerator) signBlockTransactions(block *wire.MsgBlock) {
 	for txIdx := 1; txIdx < len(block.Transactions); txIdx++ {
 		tx := block.Transactions[txIdx]
 		for i, txIn := range tx.TxIn {
-			if len(txIn.Witness) > 0 {
+			if txIn.HasWitness() {
 				continue
 			}
 			pkScript, value := g.findOutput(block, txIn.PreviousOutPoint)
@@ -443,7 +443,7 @@ func updateWitnessCommitment(block *wire.MsgBlock) bool {
 			break
 		}
 	}
-	cb.TxIn[0].Witness = nil
+	cb.TxIn[0].SetWitness(nil)
 
 	utilTxns := make([]*btcutil.Tx, len(block.Transactions))
 	for i, tx := range block.Transactions {
@@ -552,7 +552,7 @@ func (g *testGenerator) nextBlock(blockName string, spend *testhelper.SpendableO
 
 	// Attach a certificate unless the munger already set one.
 	if block.BlockCertificate() == nil {
-		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.params, nextHeight)
+		cert, err := blockchain.SolveBlock(block.BlockHeader(), g.tip.BlockHeader(), g.params, nextHeight)
 		if err != nil {
 			panic(fmt.Sprintf("failed to solve block %q: %v", blockName, err))
 		}
@@ -714,14 +714,17 @@ func (g *testGenerator) padBlockToVsize(b *wire.MsgBlock, targetVsize int) {
 	// (Taproot sighash commits to outputs, which changed).
 	for _, tx := range b.Transactions[1:] {
 		for _, txIn := range tx.TxIn {
-			txIn.Witness = nil
+			txIn.SetWitness(nil)
 		}
 	}
 	g.signBlockTransactions(b)
 	updateWitnessCommitment(b)
 
 	b.BlockHeader().MerkleRoot = calcMerkleRoot(b.Transactions)
-	cert, _ := blockchain.SolveBlock(b.BlockHeader(), g.params, g.tipHeight+1)
+	cert, err := blockchain.SolveBlock(b.BlockHeader(), g.tip.BlockHeader(), g.params, g.tipHeight+1)
+	if err != nil {
+		panic(fmt.Sprintf("failed to solve block: %v", err))
+	}
 	b.MsgHeader.MsgCertificate = wire.MsgCertificate{Certificate: cert}
 }
 
@@ -1101,7 +1104,7 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 	tests = append(tests, []TestInstance{
 		acceptBlock("b13", b13, false, true),
 		acceptBlock("b14", b14, false, true),
-		rejectBlock("b12", b12, blockchain.ErrBadCoinbaseValue),
+		acceptBlock("b12", b12, false, false),
 		expectTipBlock("b13", b13),
 	})
 
@@ -1406,7 +1409,6 @@ func Generate(includeLargeReorg bool) (tests [][]TestInstance, err error) {
 	b46a := g.nextBlock("b46a", outs[14])
 	{
 		origHash := b46a.BlockHash()
-		// Set a V1 certificate with ProofData exceeding MaxSize
 		oversizedProof := make([]byte, wire.CertificateMaxSize+1)
 		b46a.MsgHeader.MsgCertificate = wire.MsgCertificate{
 			Certificate: &wire.CertificateV1{
