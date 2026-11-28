@@ -43,6 +43,72 @@ fn hash_leaves(hasher: &Blake3Hasher, data: &[u8], chunk_len: usize) -> Vec<Dige
         .collect()
 }
 
+/// The chaining values of the `subtree_leaves`-leaf subtrees that a slice of
+/// a larger tree's leaves is made of, in order.
+///
+/// `data` holds whole `chunk_len`-byte leaves of a tree whose first is leaf
+/// `first_leaf`, which must start a subtree. Every value is the node
+/// [`MerkleTree`] over the whole data would hold at level
+/// `log2(subtree_leaves)` (non-root; the last may cover fewer leaves, as the
+/// whole tree's last does), unless the data holds at most `subtree_leaves`
+/// leaves: the single value is then the whole tree's non-root chaining
+/// value, which [`MerkleTree`] holds nowhere (its top layer is the
+/// ROOT-flagged root). An expert-parallel miner hashes its rows of a
+/// committed matrix this way, then merges every rank's nodes to the root.
+pub fn subtree_cvs(
+    data: &[u8],
+    key: Digest,
+    first_leaf: u64,
+    chunk_len: usize,
+    subtree_leaves: usize,
+) -> Result<Vec<Digest>> {
+    ensure!(
+        is_allowed_chunk_len(chunk_len),
+        "chunk_len {chunk_len} is not in {ALLOWED_CHUNK_LENS:?}"
+    );
+    ensure!(
+        subtree_leaves.is_power_of_two(),
+        "subtree_leaves {subtree_leaves} is not a power of two"
+    );
+    ensure!(
+        !data.is_empty() && data.len().is_multiple_of(chunk_len),
+        "data ({} bytes) must be whole {chunk_len}-byte leaves",
+        data.len()
+    );
+    ensure!(
+        first_leaf.is_multiple_of(subtree_leaves as u64),
+        "first_leaf {first_leaf} does not start a {subtree_leaves}-leaf subtree"
+    );
+    ensure!(
+        subtree_leaves <= usize::MAX / chunk_len,
+        "subtree_leaves {subtree_leaves} at chunk_len {chunk_len} overflow the block size"
+    );
+    let leaves = (data.len() / chunk_len) as u64;
+    ensure!(
+        first_leaf
+            .checked_add(leaves)
+            .is_some_and(|end| end <= u64::MAX / CHUNK_LEN as u64),
+        "leaves {leaves} at first_leaf {first_leaf} exceed BLAKE3's addressable chunks"
+    );
+    let hasher = Blake3Hasher::with_key(key);
+    Ok(data
+        .par_chunks(subtree_leaves * chunk_len)
+        .enumerate()
+        .map(|(block, bytes)| {
+            let first = first_leaf + (block * subtree_leaves) as u64;
+            let mut layer: Vec<Digest> = bytes
+                .chunks(chunk_len)
+                .enumerate()
+                .map(|(i, leaf)| hasher.chunk_cv(leaf, first + i as u64))
+                .collect();
+            while layer.len() > 1 {
+                layer = hasher.combine_layer(&layer);
+            }
+            layer[0]
+        })
+        .collect())
+}
+
 // ============================================================================
 // MerkleTree
 // ============================================================================
@@ -604,6 +670,55 @@ mod tests {
 
     fn test_key() -> Digest {
         *b"0123456789abcdef0123456789abcdef"
+    }
+
+    // ---- Subtree chaining values ----
+
+    #[test]
+    fn test_subtree_cvs_are_the_whole_trees_nodes() {
+        let key = test_key();
+        for chunk_len in ALLOWED_CHUNK_LENS {
+            for subtree_leaves in [1usize, 2, 8] {
+                let level = subtree_leaves.trailing_zeros() as usize;
+                for leaves in [2 * subtree_leaves + 1, 4 * subtree_leaves, 37] {
+                    let data = test_data(leaves * chunk_len);
+                    let tree = MerkleTree::with_chunk_len(&data, key, chunk_len).unwrap();
+                    if level >= tree.layers.len() - 1 {
+                        continue;
+                    }
+                    let nodes = &tree.layers[level];
+                    let whole = subtree_cvs(&data, key, 0, chunk_len, subtree_leaves).unwrap();
+                    assert_eq!(&whole, nodes, "{chunk_len}/{subtree_leaves}/{leaves}");
+                    // Any subtree-aligned slice gives its own nodes.
+                    let start = subtree_leaves;
+                    let slice = &data[start * chunk_len..];
+                    let got =
+                        subtree_cvs(slice, key, start as u64, chunk_len, subtree_leaves).unwrap();
+                    assert_eq!(
+                        got,
+                        nodes[1..],
+                        "{chunk_len}/{subtree_leaves}/{leaves} slice"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_subtree_cvs_reject_bad_arguments() {
+        let key = test_key();
+        let data = test_data(4 * 256);
+        assert!(subtree_cvs(&data, key, 0, 100, 2).is_err());
+        assert!(subtree_cvs(&data, key, 0, 256, 3).is_err());
+        assert!(subtree_cvs(&data[..300], key, 0, 256, 2).is_err());
+        assert!(subtree_cvs(&[], key, 0, 256, 2).is_err());
+        assert!(subtree_cvs(&data, key, 1, 256, 2).is_err());
+        // Chunk counters past u64 (BLAKE3 offsets are leaf * CHUNK_LEN bytes).
+        assert!(subtree_cvs(&data, key, u64::MAX - 3, 256, 1).is_err());
+        let last = u64::MAX / CHUNK_LEN as u64;
+        assert!(subtree_cvs(&data, key, last - 3, 256, 1).is_err());
+        assert!(subtree_cvs(&data, key, last - 4, 256, 1).is_ok());
+        assert!(subtree_cvs(&data, key, 0, 256, 1 << (usize::BITS - 2)).is_err());
     }
 
     // ---- Tree construction ----
