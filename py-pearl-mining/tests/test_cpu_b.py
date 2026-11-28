@@ -70,3 +70,36 @@ def test_prepare_rows_rejects_bad_shapes():
         prepare(4, 128)
     with pytest.raises(ValueError, match="one value per row"):
         prepare(4, 256, beta=array("H", [ONE_BF16] * 3))
+
+
+def subtree_roots(data, first_leaf, chunk_len=256, subtree_leaves=4, threads=2):
+    out = array("B", bytes(-(-len(data) // (chunk_len * subtree_leaves)) * 32))
+    pearl_mining.cpu_b_subtree_roots(KEY, data, first_leaf, chunk_len, subtree_leaves, out, threads)
+    return out
+
+
+def test_subtree_roots_tile_and_are_thread_independent():
+    data = bytes((i * 7) % 251 for i in range(256 * 4 * 5))
+    whole = subtree_roots(data, 0)
+    assert len({whole[i : i + 32].tobytes() for i in range(0, len(whole), 32)}) == 5
+    assert whole == subtree_roots(data, 0, threads=7)
+    # A slice starting at a subtree gives that slice's nodes of the same tree.
+    assert subtree_roots(data[256 * 8 :], 8) == whole[64:]
+    # The leaf position is hashed: the same bytes elsewhere are other nodes.
+    assert subtree_roots(data[: 256 * 4], 4) != whole[:32]
+
+
+def test_subtree_roots_reject_bad_arguments():
+    data = bytes(256 * 8)
+    with pytest.raises(ValueError, match="roots holds"):
+        pearl_mining.cpu_b_subtree_roots(KEY, data, 0, 256, 4, array("B", bytes(32)), 1)
+    with pytest.raises(ValueError, match="does not start"):
+        subtree_roots(data, 2)
+    with pytest.raises(ValueError, match="whole 256-byte leaves"):
+        subtree_roots(data[:300], 0)
+    with pytest.raises(ValueError, match="not in"):
+        subtree_roots(bytes(100 * 8), 0, chunk_len=100)
+    with pytest.raises(ValueError, match="positive"):
+        pearl_mining.cpu_b_subtree_roots(KEY, data, 0, 0, 4, array("B", bytes(32)), 1)
+    with pytest.raises(ValueError, match="positive"):
+        pearl_mining.cpu_b_subtree_roots(KEY, data, 0, 256, 0, array("B", bytes(32)), 1)

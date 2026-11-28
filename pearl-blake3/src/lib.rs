@@ -8,7 +8,8 @@
 pub mod hasher;
 pub mod merkle;
 
-/// Python FFI bindings for [`MerkleTree`] and [`MerkleProof`].
+/// Python FFI bindings for [`MerkleTree`] and [`MerkleProof`], and the keyed
+/// chunk/parent/root compressions (`chunk_cvs`, `parent_cvs`, `root_cv`).
 #[cfg(feature = "pyo3")]
 mod merkle_py;
 
@@ -20,18 +21,22 @@ pub use hasher::{
     B3F_ROOT,
 };
 pub use merkle::{
-    is_allowed_chunk_len, pad_to_chunk_boundary, padded_chunk_len, MerkleProof, MerkleTree,
-    ALLOWED_CHUNK_LENS,
+    is_allowed_chunk_len, pad_to_chunk_boundary, padded_chunk_len, subtree_cvs, MerkleProof,
+    MerkleTree, ALLOWED_CHUNK_LENS,
 };
 
 #[cfg(feature = "extension-module")]
 #[pyo3::pymodule]
 fn pearl_blake3(module: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     use pyo3::types::PyModuleMethods;
+    use pyo3::wrap_pyfunction;
 
     module.add("BLAKE3_CHUNK_LEN", BLAKE3_CHUNK_LEN)?;
     module.add("ALLOWED_CHUNK_LENS", ALLOWED_CHUNK_LENS)?;
     module.add_class::<MerkleTree>()?;
     module.add_class::<MerkleProof>()?;
+    module.add_function(wrap_pyfunction!(merkle_py::chunk_cvs, module)?)?;
+    module.add_function(wrap_pyfunction!(merkle_py::parent_cvs, module)?)?;
+    module.add_function(wrap_pyfunction!(merkle_py::root_cv, module)?)?;
     Ok(())
 }

@@ -1,25 +1,120 @@
-//! Python bindings for [`MerkleTree`] and [`MerkleProof`].
+//! Python bindings for [`MerkleTree`] and [`MerkleProof`], and the tree's
+//! keyed chunk and parent compressions.
 //!
-//! Provides `#[pymethods]` implementations that extend the pyo3 classes defined in [`merkle`].
+//! Provides `#[pymethods]` implementations that extend the pyo3 classes defined in [`merkle`],
+//! and [`chunk_cvs`], [`parent_cvs`] and [`root_cv`]: a caller that holds only part of a
+//! tree's leaves (an expert-parallel miner's slice of B) rebuilds and opens its nodes with
+//! them, exactly as [`MerkleTree`] hashes them.
 
 use blake3::{CHUNK_LEN, OUT_LEN};
-use pyo3::{exceptions::PyValueError, pymethods, types::PyBytes, Bound, PyResult, Python};
+use pyo3::{
+    exceptions::PyValueError, pyfunction, pymethods, types::PyBytes, Bound, PyResult, Python,
+};
 
-use crate::hasher::Digest;
-use crate::merkle::{MerkleProof, MerkleTree};
+use crate::hasher::{Blake3Hasher, Digest};
+use crate::merkle::{subtree_cvs, MerkleProof, MerkleTree};
+
+fn parse_key(key: &[u8]) -> PyResult<Digest> {
+    key.try_into().map_err(|_| {
+        PyValueError::new_err(format!(
+            "key must be exactly {} bytes, got {}",
+            OUT_LEN,
+            key.len()
+        ))
+    })
+}
+
+fn parse_digests(bytes: &[u8], name: &str) -> PyResult<Vec<Digest>> {
+    if !bytes.len().is_multiple_of(OUT_LEN) {
+        return Err(PyValueError::new_err(format!(
+            "{name} ({} bytes) must be whole {OUT_LEN}-byte digests",
+            bytes.len()
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(OUT_LEN)
+        .map(|digest| digest.try_into().expect("chunks_exact yields digests"))
+        .collect())
+}
+
+/// The keyed chaining values of the consecutive `chunk_len`-byte leaves `data`,
+/// the first being leaf `first_leaf` of its tree (leaf `i` hashes at chunk
+/// counter `i`), concatenated: the tree's leaf nodes, as [`MerkleTree`] hashes them.
+#[pyfunction]
+#[cfg_attr(not(feature = "extension-module"), allow(dead_code))]
+#[pyo3(signature = (data, key, first_leaf, chunk_len = CHUNK_LEN))]
+pub(crate) fn chunk_cvs<'py>(
+    py: Python<'py>,
+    data: &[u8],
+    key: &[u8],
+    first_leaf: u64,
+    chunk_len: usize,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let key = parse_key(key)?;
+    let cvs = py
+        .allow_threads(|| subtree_cvs(data, key, first_leaf, chunk_len, 1))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyBytes::new(py, cvs.as_flattened()))
+}
+
+/// The keyed non-root parents of the concatenated child chaining values
+/// `left[i]` and `right[i]`, concatenated: one tree layer up.
+#[pyfunction]
+#[cfg_attr(not(feature = "extension-module"), allow(dead_code))]
+pub(crate) fn parent_cvs<'py>(
+    py: Python<'py>,
+    left: &[u8],
+    right: &[u8],
+    key: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let hasher = Blake3Hasher::with_key(parse_key(key)?);
+    let (left, right) = (parse_digests(left, "left")?, parse_digests(right, "right")?);
+    if left.len() != right.len() {
+        return Err(PyValueError::new_err(format!(
+            "left holds {} digests, right {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    let parents: Vec<Digest> = left
+        .iter()
+        .zip(&right)
+        .map(|(l, r)| hasher.parent_cv(l, r))
+        .collect();
+    Ok(PyBytes::new(py, parents.as_flattened()))
+}
+
+/// The keyed root of the tree whose top two nodes are `left` and `right`
+/// (each one 32-byte chaining value): [`MerkleTree`]'s ROOT-flagged root.
+#[pyfunction]
+#[cfg_attr(not(feature = "extension-module"), allow(dead_code))]
+pub(crate) fn root_cv<'py>(
+    py: Python<'py>,
+    left: &[u8],
+    right: &[u8],
+    key: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let hasher = Blake3Hasher::with_key(parse_key(key)?);
+    let one = |bytes: &[u8], name: &str| -> PyResult<Digest> {
+        bytes.try_into().map_err(|_| {
+            PyValueError::new_err(format!(
+                "{name} must be exactly {OUT_LEN} bytes, got {}",
+                bytes.len()
+            ))
+        })
+    };
+    Ok(PyBytes::new(
+        py,
+        &hasher.root_cv(&one(left, "left")?, &one(right, "right")?),
+    ))
+}
 
 #[pymethods]
 impl MerkleTree {
     #[new]
     #[pyo3(signature = (data, key, chunk_len = CHUNK_LEN))]
     fn py_new(data: &[u8], key: &[u8], chunk_len: usize) -> PyResult<Self> {
-        let key: [u8; OUT_LEN] = key.try_into().map_err(|_| {
-            PyValueError::new_err(format!(
-                "key must be exactly {} bytes, got {}",
-                OUT_LEN,
-                key.len()
-            ))
-        })?;
+        let key = parse_key(key)?;
         Self::with_chunk_len(data, key, chunk_len).map_err(|e| PyValueError::new_err(e.to_string()))
     }
 

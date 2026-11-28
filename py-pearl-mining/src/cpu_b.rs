@@ -1,4 +1,5 @@
-//! CPU B preparation ([`zk_pow::v4::api::cpu_b`]) over caller-owned buffers.
+//! CPU B preparation ([`zk_pow::v4::api::cpu_b`], and an expert-parallel
+//! rank's B subtree hashes) over caller-owned buffers.
 //!
 //! Every function writes into C-contiguous buffers the caller allocated (numpy
 //! views of torch tensors, `array.array`, ...), releases the GIL, and runs on a
@@ -137,10 +138,60 @@ fn cpu_b_prepare_rows(
         .map_err(value_error)
 }
 
+/// Fills `roots` (32 bytes per subtree) with the chaining values of the
+/// `subtree_leaves`-leaf subtrees of the keyed Merkle tree that `data` is
+/// made of ([`pearl_blake3::subtree_cvs`]).
+///
+/// `data` holds whole `chunk_len`-byte leaves of a larger tree, the first
+/// being leaf `first_leaf` (which starts a subtree): an expert-parallel
+/// rank's rows of a committed B plane, zero-padded to whole leaves.
+#[pyfunction]
+#[pyo3(signature = (key, data, first_leaf, chunk_len, subtree_leaves, roots, threads))]
+#[allow(clippy::too_many_arguments)]
+fn cpu_b_subtree_roots(
+    py: Python<'_>,
+    key: [u8; 32],
+    data: PyBuffer<u8>,
+    first_leaf: u64,
+    chunk_len: usize,
+    subtree_leaves: usize,
+    roots: PyBuffer<u8>,
+    threads: usize,
+) -> PyResult<()> {
+    let pool = pool(threads)?;
+    let data = view(&data, "data")?;
+    let roots = view_mut(&roots, "roots")?;
+    if chunk_len == 0 || subtree_leaves == 0 {
+        return Err(PyValueError::new_err(
+            "chunk_len and subtree_leaves must be positive",
+        ));
+    }
+    let subtrees = (data.len() / chunk_len).div_ceil(subtree_leaves);
+    if roots.len() != subtrees * 32 {
+        return Err(PyValueError::new_err(format!(
+            "roots holds {} bytes; {subtrees} subtrees need {}",
+            roots.len(),
+            subtrees * 32
+        )));
+    }
+    let cvs = py
+        .allow_threads(|| {
+            pool.install(|| {
+                pearl_blake3::subtree_cvs(data, key, first_leaf, chunk_len, subtree_leaves)
+            })
+        })
+        .map_err(value_error)?;
+    for (out, cv) in roots.chunks_exact_mut(32).zip(&cvs) {
+        out.copy_from_slice(cv);
+    }
+    Ok(())
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CPU_B_RANK", cpu_b::RANK)?;
     m.add("CPU_B_TILE_COLS", cpu_b::TILE_COLS)?;
     m.add_function(wrap_pyfunction!(cpu_b_noise_lines, m)?)?;
     m.add_function(wrap_pyfunction!(cpu_b_prepare_rows, m)?)?;
+    m.add_function(wrap_pyfunction!(cpu_b_subtree_roots, m)?)?;
     Ok(())
 }
